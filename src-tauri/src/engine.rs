@@ -72,6 +72,33 @@ struct PendingAgent {
 /// would otherwise sit in the queue forever; the oldest is dropped past this.
 const MAX_PENDING_AGENTS: usize = 32;
 
+/// Where a session physically runs, so the widget can visually distinguish a
+/// session bridged in from a Linux VM/WSL from one on the host itself. Two VMs
+/// whose project folders share a basename would otherwise render identically
+/// (the host can't read a VM path's git branch either). Display-only.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    /// A session on this machine.
+    Host,
+    /// A session reaching us from a Linux VM/WSL (over the bridge or mirrored
+    /// loopback).
+    Remote,
+}
+
+/// Heuristic origin from a session's cwd. **Windows-host only:** a native
+/// Windows session's cwd is a drive path (`C:\...`), so a POSIX-absolute cwd
+/// (leading `/`) means the session runs in a Linux VM/WSL and reached us over
+/// the bridge. On a POSIX host we can't tell host from guest by path alone, so
+/// we never guess (every row stays `Host`).
+fn origin_from_cwd(cwd: &str) -> Origin {
+    if cfg!(target_os = "windows") && cwd.starts_with('/') {
+        Origin::Remote
+    } else {
+        Origin::Host
+    }
+}
+
 /// A single tracked Claude Code session.
 #[derive(Clone, Debug)]
 struct Session {
@@ -297,6 +324,9 @@ pub struct SessionView {
     /// subtle marker so a worktree session is distinguishable from a checkout of
     /// the same repo. Display-only.
     pub worktree: bool,
+    /// Where the session runs (host vs a bridged Linux VM/WSL). Display-only —
+    /// the widget tags remote rows so same-named VM folders are distinguishable.
+    pub origin: Origin,
     pub state: State,
     pub stale: bool,
     /// Seconds the session has been in its current state.
@@ -1052,6 +1082,7 @@ impl Engine {
                     folder,
                     branch,
                     worktree: s.git_worktree,
+                    origin: origin_from_cwd(&s.cwd),
                     state: s.state,
                     stale: s.stale,
                     seconds_in_state: now.duration_since(s.state_since).as_secs(),
@@ -1231,6 +1262,19 @@ fn combine_label(folder: String, branch: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origin_flags_posix_cwd_as_remote_on_windows_only() {
+        if cfg!(target_os = "windows") {
+            // On a Windows host a POSIX cwd can only be a bridged VM/WSL session.
+            assert_eq!(origin_from_cwd("/home/me/project"), Origin::Remote);
+            assert_eq!(origin_from_cwd("/mnt/c/code/project"), Origin::Remote);
+            assert_eq!(origin_from_cwd(r"C:\Users\me\project"), Origin::Host);
+        } else {
+            // On a POSIX host we can't distinguish by path — never guess.
+            assert_eq!(origin_from_cwd("/home/me/project"), Origin::Host);
+        }
+    }
 
     fn ev(name: &str, sid: &str) -> HookEvent {
         HookEvent {
