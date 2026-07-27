@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   labels (and click-to-focus) instead of a bare folder name. Thanks
   [@VedantMadane](https://github.com/VedantMadane) — [#36].
 
+- Linux VM / WSL session support — surface Claude Code sessions running inside
+  local Linux VMs/WSL on the tray and widget, tagged with a `VM` badge. Works
+  over WSL mirrored networking (direct loopback) or a self-healing host bridge
+  (portproxy + guest forwarder) for NAT WSL / full VMs.
+- `tools/vm-bridge/` — guest hook installers, host bridge scripts, and a setup
+  guide for the above.
+
 ### Fixed
 - A session no longer turns green while its agents are still working. Agents run
   in the background by default, so the ordinary case was: the main turn ends,
