@@ -265,6 +265,13 @@ code {
   gap: 10px;
 }
 
+/* Collapsed body — only rendered while the "Run script" toggle is on. */
+.sStubBody {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .sStubStatus {
   font-size: 11px;
   color: var(--label-2);

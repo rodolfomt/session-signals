@@ -43,55 +43,61 @@ export function StubDetail({
     <div className="sStubDetail">
       <div className="sStubRow">
         <span className="sRowTitle">Run script</span>
-        <span className={`sStubStatus ${detected ? "on" : ""}`}>
-          {detected ? "stub found" : "no stub"}
-        </span>
-        <button type="button" className="sBtn" onClick={test} disabled={!detected}>
-          Test
-        </button>
         <Toggle checked={value.cli_enabled} onChange={(v) => onChange({ cli_enabled: v })} />
       </div>
-      {recurring && (
-        <>
+      {value.cli_enabled && (
+        <div className="sStubBody">
           <div className="sStubRow">
-            <div className="sChip">
-              <input
-                className="sChipInput sChipInputWide"
-                type="number"
-                min={0}
-                value={value.cooldown_secs}
-                onChange={(e) => {
-                  const v = parseInt(e.target.value, 10);
-                  if (Number.isFinite(v) && v >= 0) onChange({ cooldown_secs: v });
-                }}
-              />
-              <span className="sChipSuf">s</span>
-            </div>
-            <div className="sChip">
-              <input
-                className="sChipInput sChipInputWide"
-                type="number"
-                min={1}
-                max={MAX_TRIGGERS_CAP}
-                value={value.max_triggers}
-                onChange={(e) => {
-                  const v = parseInt(e.target.value, 10);
-                  if (Number.isFinite(v) && v >= 1) onChange({ max_triggers: v });
-                }}
-              />
-              <span className="sChipSuf">alerts</span>
-            </div>
+            <span className={`sStubStatus ${detected ? "on" : ""}`}>
+              {detected ? "stub found" : "no stub"}
+            </span>
+            <button type="button" className="sBtn" onClick={test} disabled={!detected}>
+              Test
+            </button>
           </div>
-          <p className="sStubHint">
-            {value.cooldown_secs < MIN_COOLDOWN_SECS
-              ? remaining > 0
-                ? `First alert fires immediately; repeats are off below ${MIN_COOLDOWN_SECS}s.`
-                : "Fires once, immediately."
-              : remaining > 0
-                ? `First alert fires immediately; ${remaining} more follow every ${value.cooldown_secs}s.`
-                : "Fires once, immediately."}
-          </p>
-        </>
+          {recurring && (
+            <>
+              <div className="sStubRow">
+                <div className="sChip">
+                  <input
+                    className="sChipInput sChipInputWide"
+                    type="number"
+                    min={0}
+                    value={value.cooldown_secs}
+                    onChange={(e) => {
+                      const v = parseInt(e.target.value, 10);
+                      if (Number.isFinite(v) && v >= 0) onChange({ cooldown_secs: v });
+                    }}
+                  />
+                  <span className="sChipSuf">s</span>
+                </div>
+                <div className="sChip">
+                  <input
+                    className="sChipInput sChipInputWide"
+                    type="number"
+                    min={1}
+                    max={MAX_TRIGGERS_CAP}
+                    value={value.max_triggers}
+                    onChange={(e) => {
+                      const v = parseInt(e.target.value, 10);
+                      if (Number.isFinite(v) && v >= 1) onChange({ max_triggers: v });
+                    }}
+                  />
+                  <span className="sChipSuf">alerts</span>
+                </div>
+              </div>
+              <p className="sStubHint">
+                {value.cooldown_secs < MIN_COOLDOWN_SECS
+                  ? remaining > 0
+                    ? `First alert fires immediately; repeats are off below ${MIN_COOLDOWN_SECS}s.`
+                    : "Fires once, immediately."
+                  : remaining > 0
+                    ? `First alert fires immediately; ${remaining} more follow every ${value.cooldown_secs}s.`
+                    : "Fires once, immediately."}
+              </p>
+            </>
+          )}
+        </div>
       )}
     </div>
   );

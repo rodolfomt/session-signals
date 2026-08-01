@@ -125,7 +125,128 @@ pub fn init(app: &AppHandle) {
     if !readme.exists() {
         let _ = std::fs::write(&readme, README_TEXT);
     }
+    seed_example_stubs(&dir);
     let _ = ALERTS_DIR_PATH.set(dir);
+}
+
+/// States that ship a working example stub out of the box. Chosen to cover
+/// the two states that notify by default (`NeedsYou`, `WaitingReview`) plus
+/// `Ready` — `Working` is left unseeded since it's off by default and, per
+/// its own Settings hint, the state a user least wants pinged for.
+const EXAMPLE_STUB_STATES: [State; 3] = [State::NeedsYou, State::Ready, State::WaitingReview];
+
+/// The one stub extension seeded as a working example, chosen per platform
+/// from [`stub_extensions`]: always a plain-text script a user can open and
+/// read, never the binary `.exe` Windows also accepts as a stub.
+fn example_stub_extension() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "bat"
+    } else {
+        "sh"
+    }
+}
+
+/// Seed a working example stub for each of [`EXAMPLE_STUB_STATES`] into
+/// `dir`, one per call, skipping any filename that already exists — this
+/// never overwrites a stub the user has since customized or replaced. Each
+/// example does exactly one thing: append a line recording the four
+/// arguments it received to a log file in its own `logs/<state>/`
+/// subfolder, seeded with a heading explaining what wrote it and why. Purely
+/// illustrative — `cli_enabled` still defaults to `false`, so nothing fires
+/// until the state's "Run script" toggle is turned on in Settings.
+fn seed_example_stubs(dir: &Path) {
+    for state in EXAMPLE_STUB_STATES {
+        let slug = state_slug(state);
+        let ext = example_stub_extension();
+        let path = dir.join(format!("on_{slug}.{ext}"));
+        if path.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::write(&path, example_stub_source(slug, ext)) {
+            eprintln!(
+                "beacon: could not seed example stub {}: {e}",
+                path.display()
+            );
+            continue;
+        }
+        // Unix has no "executable" file attribute equivalent to Windows'
+        // extension-based association — a freshly-written .sh file resolves
+        // as a stub (`is_file()`) but the kernel refuses to `execve` it
+        // without +x, exactly the asymmetry documented in this module's own
+        // top-level comment. Without this, our own shipped example would
+        // silently fail to launch on first use.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            {
+                eprintln!(
+                    "beacon: could not mark example stub {} executable: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Source text for a logging-only example stub, native to the current
+/// platform's scripting convention (`.bat` on Windows, `.sh` elsewhere).
+/// Both variants are functionally identical: read the four positional
+/// arguments, create `logs/<slug>/log.txt` with an explanatory heading on
+/// first run, then append one line per invocation.
+fn example_stub_source(slug: &str, ext: &str) -> String {
+    if ext == "bat" {
+        format!(
+            r##"@echo off
+setlocal
+set "STATE=%~1"
+set "PROJECT=%~2"
+set "BRANCH=%~3"
+set "DESCRIPTOR=%~4"
+set "LOGDIR=%~dp0logs\{slug}"
+if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
+set "LOGFILE=%LOGDIR%\log.txt"
+if not exist "%LOGFILE%" (
+  >"%LOGFILE%" echo # Session Signals -- {slug} stub log
+  >>"%LOGFILE%" echo # Written by on_{slug}.bat, a working example stub shipped
+  >>"%LOGFILE%" echo # with Session Signals. Every time this state's "Run script"
+  >>"%LOGFILE%" echo # toggle is on in Settings and the alert fires -- or you press
+  >>"%LOGFILE%" echo # Test -- this script appends one line below: the time, then
+  >>"%LOGFILE%" echo # the four positional arguments Session Signals always passes.
+  >>"%LOGFILE%" echo(
+)
+>>"%LOGFILE%" echo %DATE% %TIME% state=%STATE% project=%PROJECT% branch=%BRANCH% descriptor=%DESCRIPTOR%
+endlocal
+"##,
+            slug = slug
+        )
+    } else {
+        format!(
+            r##"#!/bin/sh
+STATE="$1"
+PROJECT="$2"
+BRANCH="$3"
+DESCRIPTOR="$4"
+DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+LOGDIR="$DIR/logs/{slug}"
+mkdir -p "$LOGDIR"
+LOGFILE="$LOGDIR/log.txt"
+if [ ! -f "$LOGFILE" ]; then
+  {{
+    echo "# Session Signals -- {slug} stub log"
+    echo "# Written by on_{slug}.sh, a working example stub shipped with"
+    echo "# Session Signals. Every time this state's \"Run script\" toggle"
+    echo "# is on in Settings and the alert fires -- or you press Test --"
+    echo "# this script appends one line below: the time, then the four"
+    echo "# positional arguments Session Signals always passes."
+    echo ""
+  }} > "$LOGFILE"
+fi
+echo "$(date) state=$STATE project=$PROJECT branch=$BRANCH descriptor=$DESCRIPTOR" >> "$LOGFILE"
+"##,
+            slug = slug
+        )
+    }
 }
 
 const README_TEXT: &str = "\
@@ -162,7 +283,18 @@ rather than run something unintended. A .exe has no such caveat.)
 No environment variables are set. Output is discarded. A stub still
 running after 30 seconds is killed.
 
-Alerts must also be enabled for that state in Settings.
+The \"Run script\" toggle for a state is OFF by default in Settings, even
+when a stub is present — running a local executable is a bigger step than
+a sound or notification, so it's always an explicit opt-in.
+
+Three working examples ship pre-populated in this folder: on_needs_you,
+on_ready, and on_waiting_review (on_working is left for you to write, since
+that state is off by default and the noisiest one to alert on). Each one
+only logs — it appends a line recording the four arguments above to its
+own logs/<state>/log.txt, with a heading on first run explaining what wrote
+it. Turn on that state's \"Run script\" toggle and press Test to see it
+work, or open the log after a real trigger. Delete or overwrite any of
+them to replace it with your own stub of the same name.
 ";
 
 /// Concurrency guard: which `session:state` keys currently have a stub in
@@ -304,6 +436,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn example_stub_extension_is_platform_appropriate() {
+        let expected = if cfg!(target_os = "windows") {
+            "bat"
+        } else {
+            "sh"
+        };
+        assert_eq!(example_stub_extension(), expected);
+    }
+
+    #[test]
+    fn example_stub_source_names_itself_and_its_own_log_folder() {
+        for (ext, shebang) in [("bat", "@echo off"), ("sh", "#!/bin/sh")] {
+            let src = example_stub_source("needs_you", ext);
+            assert!(
+                src.starts_with(shebang),
+                "{ext} source must start with {shebang}"
+            );
+            assert!(
+                src.contains("on_needs_you"),
+                "{ext} source must name its own file"
+            );
+            assert!(
+                src.contains("needs_you"),
+                "{ext} source must reference its own log subfolder"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_example_stubs_creates_exactly_the_three_named_states() {
+        let dir = scratch_dir("seed-new");
+        seed_example_stubs(&dir);
+        let ext = example_stub_extension();
+        for state in EXAMPLE_STUB_STATES {
+            let path = dir.join(format!("on_{}.{ext}", state_slug(state)));
+            assert!(path.is_file(), "{} must be seeded", path.display());
+        }
+        // `Working` is deliberately not in EXAMPLE_STUB_STATES.
+        assert!(!dir.join(format!("on_working.{ext}")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_example_stubs_never_overwrites_an_existing_file() {
+        let dir = scratch_dir("seed-preserve");
+        let ext = example_stub_extension();
+        let path = dir.join(format!("on_needs_you.{ext}"));
+        std::fs::write(&path, "user's own stub, not ours").unwrap();
+
+        seed_example_stubs(&dir);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "user's own stub, not ours"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

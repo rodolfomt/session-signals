@@ -86,7 +86,11 @@ pub struct StateNotify {
     /// Whether this state's CLI stub in the `alerts/` folder is eligible to run.
     /// Gated by `enabled` like every other channel — a state that doesn't notify
     /// at all never spawns a stub. Harmless when `true` with no stub present:
-    /// an absent stub is a no-op, not an error (see Phase 2).
+    /// an absent stub is a no-op, not an error (see Phase 2). **Defaults to
+    /// `false`** for every state — running a local executable is a bigger
+    /// step than a sound or OS notification, so it's an explicit opt-in even
+    /// though example stubs ship pre-populated for three of the four states
+    /// (see `cli_alert::seed_example_stubs`).
     pub cli_enabled: bool,
     /// Seconds between re-alerts while a session stays in this state. One knob:
     /// this is both the minimum cooldown between re-triggers *and* the recurrence
@@ -107,7 +111,12 @@ impl StateNotify {
             enabled,
             sound: false,
             sound_name: sound_name.to_string(),
-            cli_enabled: true,
+            // Off by default, uniformly: running an arbitrary local executable
+            // is a bigger step than a sound or OS notification, so it should
+            // be an explicit opt-in per state rather than something a fresh
+            // install (or an old config gaining the field via migration)
+            // silently turns on.
+            cli_enabled: false,
             cooldown_secs: DEFAULT_ALERT_COOLDOWN_SECS,
             max_triggers: DEFAULT_MAX_TRIGGERS,
         }
@@ -405,7 +414,7 @@ mod tests {
             &cfg.ready,
             &cfg.waiting_review,
         ] {
-            assert!(pref.cli_enabled);
+            assert!(!pref.cli_enabled);
             assert_eq!(pref.cooldown_secs, DEFAULT_ALERT_COOLDOWN_SECS);
             assert_eq!(pref.max_triggers, DEFAULT_MAX_TRIGGERS);
         }
@@ -477,7 +486,7 @@ mod tests {
         ] {
             assert_eq!(pref.cooldown_secs, DEFAULT_ALERT_COOLDOWN_SECS);
             assert_eq!(pref.max_triggers, DEFAULT_MAX_TRIGGERS);
-            assert!(pref.cli_enabled);
+            assert!(!pref.cli_enabled);
         }
         // ...while the existing per-state gate stays differentiated.
         assert!(cfg.needs_you.enabled);
