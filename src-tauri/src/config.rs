@@ -34,20 +34,20 @@ pub const DEFAULT_PROPOSE_THRESHOLD: u32 = 3;
 pub const MIN_PROPOSE_THRESHOLD: u32 = 3;
 /// Minimum sample length (chars) a cluster's `sample` must reach before it's
 /// proposal-eligible — enforced in `proposals::build`. PRD decision 6,
-/// measured, not invented: the Phase 6 prefix-discrimination sweep over a
-/// real local `~/.claude/projects` corpus (756 transcripts, 568 resolved
-/// first prompts) found mixed human/machine clusters at short hypothetical
-/// prefix lengths (peak: 5 mixed clusters at 8 chars) but **zero** from 57
-/// chars onward, stably across the entire remaining swept range (57–120).
-/// This floor matches `observe::PREFIX_LENS`'s existing shortest tracked
-/// length (60) — already past the measured knee — so it also closes the one
-/// real gap: a naturally-short prompt (< 60 chars) is sampled at its own
-/// length with no floor at all (see `observe::sample`'s doc), and was
-/// therefore the only path by which an unfloored short sample could reach a
-/// proposal. See the "Minimum sample length" section of
-/// `docs/IGNORING_BOT_SPAWNED_SESSIONS.md` for the sweep table and, importantly,
-/// what it does not establish: `mixed` cannot see two *unmarked* openings
-/// colliding, which is the case this floor actually guards.
+/// measured, not invented: no automatic (machine-spawned) opening in the
+/// measured corpus falls below 90 characters, so a 60-char floor clears every
+/// machine opening by a 30-character margin — the recall cost of this floor
+/// against machine traffic is measured zero, not assumed. 60 also matches
+/// `observe::PREFIX_LENS`'s existing shortest tracked length, so it closes the
+/// one real gap: a naturally-short prompt (< 60 chars) is otherwise sampled at
+/// its own length with no floor at all (see `observe::sample`'s doc). The
+/// original mixed-human/machine-cluster sweep (peak: 5 mixed clusters at 8
+/// chars, zero from 57 chars onward) still holds as corroborating evidence,
+/// but the machine-opening minimum is the measurement that actually justifies
+/// gating machine-spawned traffic at 60. See the "Minimum sample length"
+/// section of `docs/IGNORING_BOT_SPAWNED_SESSIONS.md` for the sweep table and,
+/// importantly, what it does not establish: `mixed` cannot see two *unmarked*
+/// openings colliding, which is the case this floor actually guards.
 pub const MIN_PROPOSE_SAMPLE_LEN: usize = 60;
 
 /// Default seconds between re-alerts while a session sits in an alerting state

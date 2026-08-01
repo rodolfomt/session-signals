@@ -4,9 +4,11 @@
 //!
 //! **Reads a real, LOCAL, uncommitted corpus.** Never runs in CI, asserts
 //! nothing about a specific number, and never touches a fixture — only that
-//! the sweep executed and produced a table. The table is the deliverable;
-//! paste it into `docs/internal/measurements.md` (the archived raw record); the
-//! published summary lives in `docs/IGNORING_BOT_SPAWNED_SESSIONS.md`.
+//! the sweep executed and produced a table. The table is the deliverable: fold
+//! any updated numbers into the "Minimum sample length" section of
+//! `docs/IGNORING_BOT_SPAWNED_SESSIONS.md`, the one published record. There is
+//! deliberately no local archive file to paste into first — a raw per-run
+//! corpus table is a working artifact, not a committed one.
 //!
 //! ```text
 //! BEACON_CORPUS=/path/to/.claude/projects cargo test --test prefix_sweep -- --ignored --nocapture

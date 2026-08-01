@@ -213,10 +213,13 @@ knee is real evidence that mixed-polarity collisions stop at 57 characters; it
 is not evidence about same-polarity collisions. It is also a single-developer
 local corpus, not a cross-user sample.
 
-One consequence that is **not** measured: a spawner whose injected opening is
-itself under 60 characters can never be proposed, at any cluster size. Both
-known ECC families are long, so there's no observed recall cost — but that's an
-assumption this corpus doesn't test, not a verified property.
+One consequence, now measured rather than assumed: a spawner whose injected
+opening is itself under 60 characters can never be proposed, at any cluster
+size. No automatic (machine-spawned) opening in this corpus falls below 90
+characters, so the 60-char floor clears every machine opening by a
+30-character margin — the recall cost against machine traffic is measured
+zero on this corpus, not merely assumed from both known ECC families being
+long.
 
 The raw record (full per-length table, method, and both Phase 6 measurements)
 is kept with the project's internal notes rather than published here; the sweep
