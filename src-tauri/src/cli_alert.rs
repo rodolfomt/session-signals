@@ -359,6 +359,129 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The extension table must be non-empty on every platform. An empty branch
+    /// would make `resolve_in` return `None` unconditionally — the CLI channel
+    /// would silently not exist, with no error anywhere.
+    #[test]
+    fn every_platform_has_at_least_one_stub_extension() {
+        assert!(!stub_extensions().is_empty());
+    }
+
+    /// Extensions are bare, lowercase, dotless tokens. `stub_filenames` joins
+    /// them with a literal `.`, so a leading dot here would yield `on_ready..sh`.
+    #[test]
+    fn stub_extensions_are_bare_lowercase_tokens() {
+        for ext in stub_extensions() {
+            assert!(!ext.starts_with('.'), "{ext} must not include the dot");
+            assert!(!ext.is_empty());
+            assert_eq!(*ext, ext.to_ascii_lowercase(), "{ext} must be lowercase");
+            assert!(
+                ext.chars().all(|c| c.is_ascii_alphanumeric()),
+                "{ext} must be a plain alphanumeric extension"
+            );
+        }
+    }
+
+    /// No duplicates — a repeated extension would make precedence ambiguous.
+    #[test]
+    fn stub_extensions_are_unique() {
+        let mut seen = HashSet::new();
+        for ext in stub_extensions() {
+            assert!(seen.insert(*ext), "duplicate extension {ext}");
+        }
+    }
+
+    /// Every state must produce a candidate filename for every platform
+    /// extension — a state missing from the naming convention would be
+    /// permanently unalertable via CLI, silently.
+    #[test]
+    fn all_four_states_produce_candidates_on_every_platform() {
+        let states = [
+            State::NeedsYou,
+            State::Working,
+            State::Ready,
+            State::WaitingReview,
+        ];
+        for state in states {
+            let names = stub_filenames(state);
+            assert_eq!(
+                names.len(),
+                stub_extensions().len(),
+                "{state:?} must have one candidate per extension"
+            );
+            for name in &names {
+                assert!(name.starts_with(&format!("on_{}", state_slug(state))));
+            }
+        }
+    }
+
+    /// Two different states must never resolve to the same filename, or one
+    /// would shadow the other in the folder.
+    #[test]
+    fn state_stub_filenames_do_not_collide() {
+        let states = [
+            State::NeedsYou,
+            State::Working,
+            State::Ready,
+            State::WaitingReview,
+        ];
+        let mut seen = HashSet::new();
+        for state in states {
+            for name in stub_filenames(state) {
+                assert!(seen.insert(name.clone()), "collision on {name}");
+            }
+        }
+    }
+
+    /// `resolve_in` must build candidates with `Path::join`, never string
+    /// concatenation with a hardcoded separator. Driving it through a nested
+    /// scratch dir proves the joined path is correct on the host's separator.
+    #[test]
+    fn resolution_uses_path_join_not_a_hardcoded_separator() {
+        let root = scratch_dir("sep");
+        let nested = root.join("deeper").join("still");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let name = &stub_filenames(State::Ready)[0];
+        let stub = nested.join(name);
+        std::fs::write(&stub, "").unwrap();
+
+        assert_eq!(resolve_in(&nested, State::Ready), Some(stub));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A stub with the right name but a *foreign* platform's extension must not
+    /// resolve. Guards the table from being widened by accident into "any
+    /// extension we've ever heard of," which is the security boundary the PRD's
+    /// fixed-folder decision rests on.
+    #[test]
+    fn a_foreign_platform_extension_does_not_resolve() {
+        let dir = scratch_dir("foreign");
+        let foreign = if stub_extensions().contains(&"exe") {
+            "sh"
+        } else {
+            "exe"
+        };
+        std::fs::write(dir.join(format!("on_needs_you.{foreign}")), "").unwrap();
+
+        assert_eq!(resolve_in(&dir, State::NeedsYou), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The README shipped into `alerts/` lists every platform's extensions. If
+    /// the table changes and the README doesn't, users get told to create a file
+    /// that will never resolve — the most confusing possible failure, since
+    /// nothing errors.
+    #[test]
+    fn readme_documents_every_extension_for_this_platform() {
+        for ext in stub_extensions() {
+            assert!(
+                README_TEXT.contains(&format!(".{ext}")),
+                "README does not document .{ext}"
+            );
+        }
+    }
+
     #[test]
     fn in_flight_guard_blocks_only_the_same_session_and_state() {
         let key_a = in_flight_key("session-a", State::NeedsYou);

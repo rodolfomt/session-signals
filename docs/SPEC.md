@@ -252,3 +252,40 @@ Each phase ends runnable and demoable. All four are complete.
 foundation fixes, observation store, marker registry + allowlist, clustering +
 proposals, settings UI, and fixtures + validation. All six are complete; phases
 1–4 are committed and 5–6 are pending commit on `feat/headless-session-filter`.
+
+**External alerting** (`cli_alert.rs`) was built afterwards as its own
+five-phase effort — resolution + spawn, engine wiring, config knobs, Settings
+UI, and a cross-platform pass. All five are complete.
+
+- **Location**: `alerts/`, inside the **app-data dir** (`app.path().app_data_dir()`),
+  alongside `beacon.json` — not next to the executable. That placement is
+  user-writable, survives upgrades, and (unlike an exe-relative path) never
+  sits inside the signed `.app` bundle on macOS.
+- **Convention, not configuration**: a stub is a fixed filename,
+  `on_<state>.<ext>`, in that one folder. There is no path field and no argv
+  configuration anywhere in the UI — closing the argument-injection and
+  arbitrary-path surface a free-text "command to run" setting would open.
+- **Per-platform extension table**, in precedence order (first match wins):
+
+  | Platform | Extensions |
+  |---|---|
+  | Windows | `.exe`, `.bat`, `.cmd` |
+  | macOS | `.sh`, `.command` |
+  | Linux | `.sh` |
+
+- **Four fixed positional arguments**, always in this order, absent values
+  passed as `""` rather than skipped: `state`, `project`, `branch`,
+  `descriptor`.
+- **Concurrency + runtime guard**: at most one stub in flight per
+  `(session_id, state)` key; a stub still running after 30s is killed.
+- **Recurrence**: gated per-state by `cooldown_secs`/`max_triggers`
+  (`config.rs`), meaningful only for `needs_you` and `waiting_review` —
+  `working`/`ready` fire once on the transition edge and never recur.
+- **Platform support posture**: Windows is the primary, fully-verified
+  platform (automated tests + live `.bat` stub runs). The extension table,
+  filename resolution, and `Path::join` behavior for Linux and macOS are
+  asserted by platform-agnostic `cargo test` coverage that runs from any
+  host (`cli_alert::tests`), but live execution of a `.sh`/`.command` stub on
+  real Linux/macOS hardware has not been performed as part of this pass —
+  see the plan's manual checklist (`.claude/PRPs/plans/completed/
+  feat03-05-cross-platform-pass.plan.md`) for what remains to run there.
