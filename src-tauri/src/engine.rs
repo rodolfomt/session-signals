@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Per-session status. Maps to the traffic-light colors in the spec.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
     /// 🔴 Blocked on the user (permission / choice / answer).
@@ -22,6 +22,8 @@ pub enum State {
     Working,
     /// 🟢 Finished its turn — okay to give new instructions.
     Ready,
+    /// 🔴▲ Finished, and you asked to review it before moving on.
+    WaitingReview,
 }
 
 /// The tray rollup across all live sessions.
@@ -29,6 +31,9 @@ pub enum State {
 #[serde(rename_all = "lowercase")]
 pub enum Rollup {
     Red,
+    /// A flagged session finished — waiting on you to look it over, not
+    /// blocked on input. Outranked only by `Red`.
+    Review,
     Orange,
     Green,
     Grey,
@@ -121,6 +126,36 @@ struct Session {
     /// reads as a bug. Reset only on a genuine `SessionStart` (a real
     /// restart), next to `reset_subagents`.
     revealed: bool,
+    /// True after a main-agent `Stop` arrived while subagents were still
+    /// live: the terminal transition (`Ready` or `WaitingReview`) is owed but
+    /// deferred until the last `SubagentStop`. See `terminal_state` and the
+    /// `Stop` / `SubagentStop` arms in `apply`.
+    awaiting_subagents: bool,
+    /// User intent: when this session's turn next finishes, land in
+    /// `WaitingReview` (red triangle) instead of `Ready`. Set via
+    /// `Engine::set_review_flag` (the widget's per-row toggle — the app's
+    /// first user→engine command). Does not survive a session restart
+    /// ("keep it simple" — cleared on a genuine `SessionStart`).
+    review_when_done: bool,
+    /// Which `state_since` the counters below belong to — the episode's
+    /// identity, not a second timestamp to keep in sync.
+    ///
+    /// `state_since` is written from more than one place (`apply`'s real
+    /// state change, `set_review_flag`'s WaitingReview→Ready restore), and
+    /// any future path that starts a new stay will write it too. Rather than
+    /// oblige every one of those sites to *also* reset the two counters —
+    /// an obligation a later contributor would silently miss — `due_alerts`
+    /// compares this against the live `state_since` and resets the counters
+    /// itself the moment they disagree. A new write site therefore gets
+    /// correct episode behavior for free.
+    alert_episode: Option<Instant>,
+    /// Alerts fired for this episode so far, counting the transition-edge
+    /// fire. Meaningful only while `alert_episode == Some(state_since)`;
+    /// `due_alerts` zeroes it otherwise.
+    alert_count: u32,
+    /// When the most recent alert fired this episode. Same validity rule as
+    /// `alert_count`. Drives the cooldown gate in `due_alerts`.
+    last_alert_at: Option<Instant>,
 }
 
 /// Parsed, transport-agnostic hook event. The listener deserializes the raw
@@ -181,6 +216,13 @@ pub struct Transition {
     /// The label's folder part alone (no branch) — what notifications title
     /// with, shipped separately so nothing re-parses the combined label.
     pub folder: String,
+    /// The label's branch part, likewise shipped structured. Handed to a CLI
+    /// alert stub as its third positional argument, so the edge fire and the
+    /// sweep's recurrence fire pass identical arguments.
+    pub branch: Option<String>,
+    /// The session's descriptor at transition time (stub argument four). Often
+    /// `None` on a brand-new session, whose transcript hasn't yielded one yet.
+    pub descriptor: Option<String>,
     pub from: Option<State>,
     pub to: State,
     /// The session's captured terminal pid at transition time, if known. Lets
@@ -201,6 +243,70 @@ pub struct SweepOutcome {
     pub changed: bool,
     /// Sessions that newly went stale this sweep: `(session_id, label)`.
     pub went_stale: Vec<(String, String)>,
+}
+
+/// One state's recurrence policy for `due_alerts`. Pushed in as a plain
+/// value from `Config::StateNotify` by `lib.rs` — this module never imports
+/// `crate::config` (see the file doc), so it has no notion of OS-sound or
+/// CLI-stub specifics, only what `due_alerts` itself needs to decide timing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlertPolicy {
+    /// Whether recurrence is on at all for this state. A cheap short-circuit
+    /// ahead of `cooldown_secs` — per-channel enablement (OS sound, CLI
+    /// stub) is checked separately at delivery time, off the engine lock.
+    pub enabled: bool,
+    /// Seconds between re-alerts. Also gates recurrence outright at `0`.
+    pub cooldown_secs: u64,
+    /// Maximum total alerts per episode, counting the transition-edge fire
+    /// `lib.rs::on_transition` delivers the moment the state is entered — so
+    /// `due_alerts` only ever contributes up to `max_triggers - 1` further
+    /// alerts, and `1` means "edge only, no recurrence". *Both* channels (OS
+    /// notification and CLI stub) fire on that edge, so the budget means the
+    /// same thing for each.
+    pub max_triggers: u32,
+}
+
+/// Recurrence policy for every state, pushed in from `Config` by `lib.rs`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AlertPolicies {
+    pub needs_you: AlertPolicy,
+    pub working: AlertPolicy,
+    pub ready: AlertPolicy,
+    pub waiting_review: AlertPolicy,
+}
+
+impl AlertPolicies {
+    /// The effective policy for `state` — the single place recurrence
+    /// eligibility is decided.
+    ///
+    /// `Working` and `Ready` are never eligible: they churn via their own
+    /// hook events (a `PostToolUse` heartbeat, the next `Stop`) and a session
+    /// sitting in either is not *stuck* in any sense the user wants nagging
+    /// about. Their config knobs still exist and still round-trip — they only
+    /// govern the transition-edge fire, which `on_transition` handles — so
+    /// returning a disabled policy here (rather than filtering inside
+    /// `due_alerts`) keeps that fact discoverable from the type and stops the
+    /// Settings UI from wiring up controls with no effect.
+    pub fn for_state(&self, state: State) -> AlertPolicy {
+        match state {
+            State::NeedsYou => self.needs_you,
+            State::WaitingReview => self.waiting_review,
+            State::Working | State::Ready => AlertPolicy::default(),
+        }
+    }
+}
+
+/// One re-alert due to fire right now, reported by `due_alerts` for the
+/// caller to deliver (OS notification + CLI stub) with no engine lock held.
+#[derive(Clone, Debug)]
+pub struct AlertRequest {
+    pub session_id: String,
+    pub state: State,
+    pub label: String,
+    pub folder: String,
+    pub branch: Option<String>,
+    pub descriptor: Option<String>,
+    pub terminal_pid: Option<i32>,
 }
 
 /// A flattened, serializable view of one session for the webview / tray menu.
@@ -235,6 +341,10 @@ pub struct SessionView {
     /// Short human descriptor of what the session is about (Claude Code's own
     /// session title, else the first prompt). `None` until derivable. Display-only.
     pub descriptor: Option<String>,
+    /// Whether this session is flagged to land in `WaitingReview` instead of
+    /// `Ready` the next time it finishes. Drives the widget's per-row toggle
+    /// (its current, engine-confirmed value — the row never guesses).
+    pub review_when_done: bool,
 }
 
 /// A terminal handle remembered across a Session Signals restart. Capture lives only in
@@ -348,9 +458,12 @@ impl Engine {
                     self.reset_subagents(&ev.session_id);
                     // A genuine restart clears a sticky reveal too — this is
                     // a fresh run, not a continuation of the block that
-                    // triggered it.
+                    // triggered it. Same for the review flag and any deferred
+                    // transition: neither should survive a restart.
                     if let Some(s) = self.sessions.get_mut(&ev.session_id) {
                         s.revealed = false;
+                        s.review_when_done = false;
+                        s.awaiting_subagents = false;
                     }
                     out
                 }
@@ -426,43 +539,97 @@ impl Engine {
                 Some("permission_prompt") | Some("elicitation_dialog") => {
                     self.transition_to(ev, State::NeedsYou)
                 }
-                // `idle_prompt` fires when a session has merely been sitting
-                // idle — it is NOT blocked on the user. Leave its state alone
-                // (a finished turn stays Ready/green; a pending permission stays
-                // red); the stale sweep greys it out after the timeout.
-                // auth_success, elicitation_complete, etc. are likewise ignored.
-                _ => ApplyOutcome {
-                    changed: false,
-                    transition: None,
-                },
+                // Known-inert: these fire PRECISELY because the session is
+                // doing nothing notable, so they must NOT touch `last_seen`.
+                // `idle_prompt` in particular fires while a session is
+                // sitting idle — heartbeating there would reset the very
+                // stale timer meant to grey it out (or actively un-stale one
+                // already marked stale), so an idle session could stay green
+                // indefinitely. Regression fix: an earlier pass collapsed
+                // this into the fail-open heartbeat below, which silently
+                // broke the documented "idle ≠ blocked; stays Ready until
+                // stale" behavior (CLAUDE.md / docs/SPEC.md §3).
+                Some("idle_prompt") | Some("auth_success") | Some("elicitation_complete") => {
+                    ApplyOutcome {
+                        changed: false,
+                        transition: None,
+                    }
+                }
+                // Genuinely uncharacterised types — `agent_completed`,
+                // `agent_needs_input`, and anything invented later — fail
+                // open to a plain heartbeat: liveness refreshes, but never a
+                // state change. Today these would otherwise land in the
+                // "ignored" bucket by accident; this makes that deliberate,
+                // so a type nobody has looked at can never silently release a
+                // deferred transition or clear a genuine `NeedsYou`/
+                // `WaitingReview` (see the fail-open tests below).
+                _ => self.heartbeat(ev),
             },
             // Terminal: the turn (or compaction) ended. `PostCompact` returns a
-            // standalone `/compact` to Ready; mid-turn it briefly shows Ready
-            // until the next work event flips it back (self-healing).
-            // `StopFailure` is a turn ended by an API error. Only the MAIN agent's
-            // turn ending means the row is Ready — a subagent's `Stop` must not
-            // clear the parent's state (esp. a pending "Needs you").
+            // standalone `/compact` to Ready (or WaitingReview, if flagged);
+            // mid-turn it briefly shows that until the next work event flips it
+            // back (self-healing). `StopFailure` is a turn ended by an API error.
+            // Only the MAIN agent's turn ending is terminal — a subagent's `Stop`
+            // must not touch the parent's state at all.
+            //
+            // Three cases once we know it's the main agent:
+            //  1. Blocked (`NeedsYou`) with subagents still live: a genuine block
+            //     outranks a subagent backlog — stay red (heartbeat only), but
+            //     remember a transition is owed once they drain.
+            //  2. Not blocked, subagents still live: the terminal transition is
+            //     real but premature — defer it (→ Working) rather than lose it;
+            //     `SubagentStop` fires it later (see below).
+            //  3. Otherwise (no live subagents, blocked-with-none-live included):
+            //     transition now, same as before — to `Ready` or, if the session
+            //     is flagged, `WaitingReview` (`terminal_state`).
             "Stop" | "StopFailure" | "PostCompact" => {
                 if is_subagent {
                     self.heartbeat(ev)
                 } else {
-                    self.transition_to(ev, State::Ready)
+                    let live = self
+                        .sessions
+                        .get(&ev.session_id)
+                        .map(|s| (s.subagent_count > 0, s.state));
+                    match live {
+                        Some((true, State::NeedsYou)) => {
+                            if let Some(s) = self.sessions.get_mut(&ev.session_id) {
+                                s.awaiting_subagents = true;
+                            }
+                            self.heartbeat(ev)
+                        }
+                        Some((true, _)) => {
+                            if let Some(s) = self.sessions.get_mut(&ev.session_id) {
+                                s.awaiting_subagents = true;
+                            }
+                            self.transition_to(ev, State::Working)
+                        }
+                        _ => {
+                            let target = self
+                                .sessions
+                                .get(&ev.session_id)
+                                .map(terminal_state)
+                                .unwrap_or(State::Ready);
+                            self.transition_to(ev, target)
+                        }
+                    }
                 }
             }
             // A subagent finished: decrement (clamped), and when the last one
             // leaves, drop the elapsed anchor so the sub-line disappears. Like
             // `SubagentStart`, this only touches the count — it does NOT move the
-            // session to Ready, which previously flipped a still-working (or
-            // still-blocked) parent to green the instant any subagent stopped.
+            // session to Ready/WaitingReview on its own, which previously flipped
+            // a still-working (or still-blocked) parent to green the instant any
+            // subagent stopped. The one narrow exception: if a main-agent `Stop`
+            // already earned a transition and deferred it (`awaiting_subagents`),
+            // the LAST `SubagentStop` releases it — unless the session is
+            // genuinely blocked, in which case the block still outranks it and
+            // the deferred transition simply keeps waiting.
             "SubagentStop" => {
                 let out = self.heartbeat(ev);
-                if let Some(s) = self.sessions.get_mut(&ev.session_id) {
-                    s.subagent_count = s.subagent_count.saturating_sub(1);
-                    if s.subagent_count == 0 {
-                        s.sub_since = None;
-                    }
+                match self.release_subagent(&ev.session_id) {
+                    Some(target) => self.transition_to(ev, target),
+                    None => out,
                 }
-                out
             }
             // Synthetic event from the terminal-capture hook: record which
             // terminal owns this session. No state change — a session can be in
@@ -489,6 +656,11 @@ impl Engine {
                         first_prompt: None,
                         first_prompt_checked_at: None,
                         revealed: false,
+                        awaiting_subagents: false,
+                        review_when_done: false,
+                        alert_episode: None,
+                        alert_count: 0,
+                        last_alert_at: None,
                     });
                 if ev.terminal_pid.is_some() {
                     s.terminal_pid = ev.terminal_pid;
@@ -576,7 +748,8 @@ impl Engine {
         // already-running sessions, which never re-fire `SessionStart`.
         let remembered = self.pending_captures.get(&ev.session_id).cloned();
         // `from`: Some(prev) on a real change, None on a same-state repeat.
-        let (from, cwd, terminal_pid) = match self.sessions.entry(ev.session_id.clone()) {
+        let (from, cwd, terminal_pid, descriptor) = match self.sessions.entry(ev.session_id.clone())
+        {
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let s = o.get_mut();
                 let prev = s.state;
@@ -584,6 +757,9 @@ impl Engine {
                 if changed_state {
                     s.state = state;
                     s.state_since = now;
+                    // No alert bookkeeping to reset here: `due_alerts` derives
+                    // episode identity from `state_since` itself and self-heals
+                    // when it moves. See `Session::alert_episode`.
                 }
                 s.last_seen = now;
                 s.stale = false;
@@ -606,6 +782,7 @@ impl Engine {
                     },
                     s.cwd.clone(),
                     s.terminal_pid,
+                    s.descriptor.clone(),
                 )
             }
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -628,8 +805,13 @@ impl Engine {
                     first_prompt: None,
                     first_prompt_checked_at: None,
                     revealed: false,
+                    awaiting_subagents: false,
+                    review_when_done: false,
+                    alert_episode: None,
+                    alert_count: 0,
+                    last_alert_at: None,
                 });
-                (Some(None), cwd, pid)
+                (Some(None), cwd, pid, None)
             }
         };
 
@@ -660,6 +842,8 @@ impl Engine {
                 session_id: ev.session_id.clone(),
                 label: combine_label(folder.clone(), branch.as_deref()),
                 folder,
+                branch,
+                descriptor,
                 from: prev,
                 to: state,
                 terminal_pid,
@@ -678,6 +862,65 @@ impl Engine {
         if let Some(s) = self.sessions.get_mut(id) {
             s.subagent_count = 0;
             s.sub_since = None;
+        }
+    }
+
+    /// Decrement a session's live subagent count (clamped at 0) and, if this
+    /// was the last one AND a transition was deferred (`awaiting_subagents`),
+    /// clear the flag and report the state to transition into — but only if
+    /// the session isn't genuinely blocked. Returns `None` when no transition
+    /// is owed (nothing deferred, subagents remain, or a real `NeedsYou`
+    /// still outranks the backlog), which is the common case and must never
+    /// resurrect an ended session — see `SubagentStop`'s caller, which only
+    /// calls `transition_to` on `Some`. A no-op (returns `None`) if the
+    /// session is unknown.
+    fn release_subagent(&mut self, id: &str) -> Option<State> {
+        let s = self.sessions.get_mut(id)?;
+        s.subagent_count = s.subagent_count.saturating_sub(1);
+        if s.subagent_count > 0 {
+            return None;
+        }
+        s.sub_since = None;
+        if s.awaiting_subagents {
+            s.awaiting_subagents = false;
+            if s.state != State::NeedsYou {
+                return Some(terminal_state(s));
+            }
+            // Deliberately dropped, not deferred further: the session is
+            // genuinely blocked, so there is nothing to release right now.
+            // This does NOT lose the transition — the user's eventual answer
+            // drives the next one via `PostToolUse`/`Stop` as normal; we just
+            // don't re-arm `awaiting_subagents` for an event that already
+            // fired. Leaving the session red is correct.
+        }
+        None
+    }
+
+    /// Set (or clear) a session's review flag: its next terminal transition
+    /// (`Stop`/`StopFailure`/`PostCompact`) lands in `WaitingReview` instead
+    /// of `Ready`. The widget's per-row toggle — the app's first
+    /// user→engine command. A no-op on an unknown session id (never panics,
+    /// never creates a row).
+    ///
+    /// Clearing the flag on a session that has ALREADY finished into
+    /// `WaitingReview` restores `Ready` immediately, rather than waiting for
+    /// another `Stop` that may never arrive for an already-finished session
+    /// (a real bug found in manual testing: the row stayed on a stale red
+    /// triangle after the user said "never mind"). This is the one direction
+    /// that's unambiguous — `WaitingReview` only ever happens because a real
+    /// finish already occurred. The reverse (flagging a session currently
+    /// sitting at plain `Ready`) is deliberately left alone: `Ready` is also
+    /// a brand-new session's resting state (`SessionStart` sets it
+    /// unconditionally), and state alone can't tell "just finished" apart
+    /// from "hasn't started a turn yet" — so flagging there only ever
+    /// affects the session's NEXT finish, same as before.
+    pub fn set_review_flag(&mut self, id: &str, flag: bool) {
+        if let Some(s) = self.sessions.get_mut(id) {
+            s.review_when_done = flag;
+            if !flag && s.state == State::WaitingReview {
+                s.state = State::Ready;
+                s.state_since = Instant::now();
+            }
         }
     }
 
@@ -939,11 +1182,82 @@ impl Engine {
         }
     }
 
+    /// Which live sessions are due a recurring re-alert right now, per
+    /// `policies`. Only sessions genuinely "stuck" — `NeedsYou` or
+    /// `WaitingReview` — are eligible; `Working`/`Ready` churn via their own
+    /// events and never accumulate a re-alert episode. Stale or
+    /// ignore-rule-hidden sessions are skipped, mirroring `rollup`.
+    ///
+    /// Takes the clock as a parameter (unlike `sweep`, which reads
+    /// `Instant::now()` directly) so tests can fast-forward multi-minute
+    /// cooldowns deterministically instead of sleeping.
+    pub fn due_alerts(&mut self, policies: &AlertPolicies, now: Instant) -> Vec<AlertRequest> {
+        let mut due = Vec::new();
+        // Borrowed once before the loop (mirrors `snapshot`'s pattern) so
+        // `session_hidden` can be called while `sessions` is mutably
+        // borrowed by the loop below.
+        let ignore = &self.ignore;
+        let never_hide = &self.never_hide;
+        for (id, s) in self.sessions.iter_mut() {
+            if s.stale || session_hidden(ignore, never_hide, s) {
+                continue;
+            }
+            // State eligibility lives entirely in `for_state` (Working/Ready
+            // come back disabled) so there is exactly one place to read it.
+            let policy = policies.for_state(s.state);
+            if !policy.enabled || policy.cooldown_secs == 0 {
+                continue;
+            }
+            // Episode identity is derived, never pushed: if `state_since` has
+            // moved since these counters were written, this is a new stay and
+            // the old bookkeeping is void. See `Session::alert_episode`.
+            if s.alert_episode != Some(s.state_since) {
+                s.alert_episode = Some(s.state_since);
+                s.alert_count = 0;
+                s.last_alert_at = None;
+            }
+            // `max_triggers` counts the transition-edge fire `on_transition`
+            // already delivered on both channels (see
+            // `AlertPolicy::max_triggers`), so recurrence contributes at most
+            // `max_triggers - 1` more.
+            let recurrence_budget = policy.max_triggers.saturating_sub(1);
+            if s.alert_count >= recurrence_budget {
+                continue;
+            }
+            let cooldown = Duration::from_secs(policy.cooldown_secs);
+            let since = s.last_alert_at.unwrap_or(s.state_since);
+            if now.duration_since(since) < cooldown {
+                continue;
+            }
+            // Booked here, before delivery, and deliberately not refunded if
+            // both channels end up silent (no stub installed; the OS
+            // notification suppressed because that terminal is frontmost).
+            // The budget counts *attempts to interrupt you*, not successful
+            // interruptions — refunding on suppression would mean a user
+            // sitting in the session accrues an untouched budget that all
+            // fires at once the moment they look away.
+            s.alert_count += 1;
+            s.last_alert_at = Some(now);
+            let (folder, branch) = label_parts(&s.cwd);
+            due.push(AlertRequest {
+                session_id: id.clone(),
+                state: s.state,
+                label: combine_label(folder.clone(), branch.as_deref()),
+                folder,
+                branch,
+                descriptor: s.descriptor.clone(),
+                terminal_pid: s.terminal_pid,
+            });
+        }
+        due
+    }
+
     /// Compute the tray rollup. Stale sessions are excluded; if none remain
-    /// live the rollup is Grey. Priority: Red > Orange > Green.
+    /// live the rollup is Grey. Priority: Red > Review > Orange > Green.
     pub fn rollup(&self) -> Rollup {
         let mut any_working = false;
         let mut any_ready = false;
+        let mut any_review = false;
         for s in self.sessions.values() {
             // Filtered (headless/machine-spawned) sessions never colour the tray.
             if session_hidden(&self.ignore, &self.never_hide, s) {
@@ -954,11 +1268,14 @@ impl Engine {
             }
             match s.state {
                 State::NeedsYou => return Rollup::Red,
+                State::WaitingReview => any_review = true,
                 State::Working => any_working = true,
                 State::Ready => any_ready = true,
             }
         }
-        if any_working {
+        if any_review {
+            Rollup::Review
+        } else if any_working {
             Rollup::Orange
         } else if any_ready {
             Rollup::Green
@@ -989,6 +1306,7 @@ impl Engine {
                 .unwrap_or(0),
             can_focus: s.terminal_pid.is_some(),
             descriptor: s.descriptor.clone(),
+            review_when_done: s.review_when_done,
         }
     }
 
@@ -1094,6 +1412,21 @@ fn attribute_rule(ignore: &IgnoreRules, s: &Session) -> Option<crate::ignore::Ma
             })
         })
         .cloned()
+}
+
+/// What "finished" means for a session right now: `WaitingReview` if it's
+/// flagged, else `Ready`. Single source of truth for the terminal transition,
+/// shared by the `Stop` arm (the common, immediate case) and the
+/// `SubagentStop` arm (the deferred-release case) so the two paths can never
+/// disagree about what finishing looks like. A free function (not a method)
+/// so callers can hold a `&mut` borrow of the session map at the same time —
+/// mirrors `session_hidden`.
+fn terminal_state(s: &Session) -> State {
+    if s.review_when_done {
+        State::WaitingReview
+    } else {
+        State::Ready
+    }
 }
 
 /// Tools that block on the user the instant they start and emit no
@@ -1368,6 +1701,251 @@ mod tests {
         }
     }
 
+    /// A policy enabled for `NeedsYou` only, with the given cooldown/max —
+    /// every other state stays at `AlertPolicy::default()` (disabled).
+    fn needs_you_only(cooldown_secs: u64, max_triggers: u32) -> AlertPolicies {
+        AlertPolicies {
+            needs_you: AlertPolicy {
+                enabled: true,
+                cooldown_secs,
+                max_triggers,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_alert_without_policy_enabled() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        e.apply(&notif("a", "permission_prompt"));
+        let now = Instant::now() + Duration::from_secs(3600);
+        // Default AlertPolicies: every state disabled.
+        assert!(e.due_alerts(&AlertPolicies::default(), now).is_empty());
+    }
+
+    #[test]
+    fn no_recurrence_when_cooldown_is_zero() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        e.apply(&notif("a", "permission_prompt"));
+        let policies = needs_you_only(0, 3);
+        let now = Instant::now() + Duration::from_secs(3600);
+        assert!(e.due_alerts(&policies, now).is_empty());
+    }
+
+    #[test]
+    fn first_recurrence_fires_only_after_cooldown_elapses() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        e.apply(&notif("a", "permission_prompt"));
+        let state_since = Instant::now();
+        let policies = needs_you_only(60, 3);
+
+        // Not yet due.
+        assert!(e
+            .due_alerts(&policies, state_since + Duration::from_secs(59))
+            .is_empty());
+
+        // Due at the cooldown boundary.
+        let due = e.due_alerts(&policies, state_since + Duration::from_secs(60));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].session_id, "a");
+        assert_eq!(due[0].state, State::NeedsYou);
+    }
+
+    #[test]
+    fn recurrence_stops_at_the_max_triggers_budget() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        e.apply(&notif("a", "permission_prompt"));
+        let state_since = Instant::now();
+        // max_triggers=3 → the initial edge notification is trigger #1, so
+        // due_alerts contributes at most 2 more.
+        let policies = needs_you_only(60, 3);
+
+        let t1 = state_since + Duration::from_secs(60);
+        assert_eq!(e.due_alerts(&policies, t1).len(), 1);
+        let t2 = t1 + Duration::from_secs(60);
+        assert_eq!(e.due_alerts(&policies, t2).len(), 1);
+        // Budget exhausted — no third re-alert, no matter how much later.
+        let t3 = t2 + Duration::from_secs(6000);
+        assert!(e.due_alerts(&policies, t3).is_empty());
+    }
+
+    #[test]
+    fn working_and_ready_never_recur_even_when_policy_enabled() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        e.apply(&ev("UserPromptSubmit", "a")); // -> Working
+        let policies = AlertPolicies {
+            working: AlertPolicy {
+                enabled: true,
+                cooldown_secs: 1,
+                max_triggers: 5,
+            },
+            ready: AlertPolicy {
+                enabled: true,
+                cooldown_secs: 1,
+                max_triggers: 5,
+            },
+            ..Default::default()
+        };
+        let now = Instant::now() + Duration::from_secs(3600);
+        assert!(e.due_alerts(&policies, now).is_empty());
+    }
+
+    #[test]
+    fn stale_session_is_never_due() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        e.apply(&notif("a", "permission_prompt"));
+        e.sessions.get_mut("a").unwrap().stale = true;
+        let policies = needs_you_only(1, 3);
+        let now = Instant::now() + Duration::from_secs(3600);
+        assert!(e.due_alerts(&policies, now).is_empty());
+    }
+
+    #[test]
+    fn hidden_session_is_never_due() {
+        // NeedsYou is deliberately avoided here: hitting NeedsYou trips the
+        // reveal-on-block safety valve, which un-hides the session on
+        // purpose (see `transition_to`) — the wrong fixture for proving
+        // `due_alerts` skips hidden rows. WaitingReview carries no such
+        // valve, so a hidden session stays hidden through it.
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.set_ignore_rules(ignore_rules());
+        e.apply(&ev_cwd("SessionStart", "a", "/tmp/ecc-homunculus/proj"));
+        e.set_review_flag("a", true);
+        e.apply(&ev_cwd("Stop", "a", "/tmp/ecc-homunculus/proj"));
+        assert!(e.is_hidden("a"));
+
+        let policies = AlertPolicies {
+            waiting_review: AlertPolicy {
+                enabled: true,
+                cooldown_secs: 1,
+                max_triggers: 3,
+            },
+            ..Default::default()
+        };
+        let now = Instant::now() + Duration::from_secs(3600);
+        assert!(e.due_alerts(&policies, now).is_empty());
+    }
+
+    /// `for_state` is the single place recurrence eligibility is decided, so
+    /// Working/Ready must come back disabled even when the user's config has
+    /// them fully switched on — their knobs govern only the transition edge.
+    #[test]
+    fn for_state_disables_recurrence_on_working_and_ready() {
+        let on = AlertPolicy {
+            enabled: true,
+            cooldown_secs: 30,
+            max_triggers: 5,
+        };
+        let all_on = AlertPolicies {
+            needs_you: on,
+            working: on,
+            ready: on,
+            waiting_review: on,
+        };
+        assert!(all_on.for_state(State::NeedsYou).enabled);
+        assert!(all_on.for_state(State::WaitingReview).enabled);
+        assert!(!all_on.for_state(State::Working).enabled);
+        assert!(!all_on.for_state(State::Ready).enabled);
+    }
+
+    /// The regression D6 was designed against: `set_review_flag` writes
+    /// `state_since` without touching the alert counters. Derived episode
+    /// identity has to catch that on its own, or a cleared-then-reflagged
+    /// session would inherit a spent budget.
+    #[test]
+    fn clearing_the_review_flag_starts_a_fresh_episode() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        e.set_review_flag("a", true);
+        e.apply(&ev("Stop", "a")); // -> WaitingReview
+        let first_since = Instant::now();
+
+        let policies = AlertPolicies {
+            waiting_review: AlertPolicy {
+                enabled: true,
+                cooldown_secs: 60,
+                max_triggers: 2,
+            },
+            ..Default::default()
+        };
+        // Spend the episode's only recurrence slot.
+        assert_eq!(
+            e.due_alerts(&policies, first_since + Duration::from_secs(60))
+                .len(),
+            1
+        );
+        assert!(e
+            .due_alerts(&policies, first_since + Duration::from_secs(3600))
+            .is_empty());
+
+        // "Never mind" -> Ready (this resets state_since, not the counters),
+        // then flag + finish again: a genuinely new episode.
+        e.set_review_flag("a", false);
+        e.set_review_flag("a", true);
+        e.apply(&ev("Stop", "a"));
+        let second_since = Instant::now();
+        assert_eq!(
+            e.due_alerts(&policies, second_since + Duration::from_secs(60))
+                .len(),
+            1,
+            "the new episode must get its own budget"
+        );
+    }
+
+    #[test]
+    fn episode_resets_when_the_session_leaves_and_returns_to_the_state() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        e.apply(&notif("a", "permission_prompt"));
+        let first_since = Instant::now();
+        let policies = needs_you_only(60, 3);
+
+        // Burn through one re-alert of the first episode.
+        assert_eq!(
+            e.due_alerts(&policies, first_since + Duration::from_secs(60))
+                .len(),
+            1
+        );
+        assert_eq!(e.sessions.get("a").unwrap().alert_count, 1);
+
+        // Leave NeedsYou and come back — a brand new episode.
+        e.apply(&ev("UserPromptSubmit", "a")); // -> Working
+        e.apply(&notif("a", "permission_prompt")); // -> NeedsYou again
+        let second_since = Instant::now();
+        // The counters are NOT eagerly zeroed by the state change — episode
+        // identity is derived, so they stay stale-but-void until `due_alerts`
+        // next looks and notices `alert_episode` no longer matches
+        // `state_since`. That indirection is what keeps every present and
+        // future `state_since` write site from having to remember to reset.
+        {
+            let s = e.sessions.get("a").unwrap();
+            assert_ne!(
+                s.alert_episode,
+                Some(s.state_since),
+                "the new stay must not be mistaken for the old episode"
+            );
+        }
+
+        // The old episode's elapsed time must not count toward the new one.
+        assert!(e
+            .due_alerts(&policies, second_since + Duration::from_secs(59))
+            .is_empty());
+        assert_eq!(
+            e.due_alerts(&policies, second_since + Duration::from_secs(60))
+                .len(),
+            1
+        );
+        // ...and the budget restarted rather than continuing: this is the new
+        // episode's first re-alert, not its second.
+        assert_eq!(e.sessions.get("a").unwrap().alert_count, 1);
+    }
+
     #[test]
     fn lifecycle_transitions() {
         let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
@@ -1515,6 +2093,38 @@ mod tests {
         // And a later idle_prompt doesn't clear the real red either.
         e.apply(&notif("a", "idle_prompt"));
         assert_eq!(e.rollup(), Rollup::Red, "idle must not clear a pending red");
+    }
+
+    /// Regression (code review H1): `idle_prompt` fires PRECISELY because a
+    /// session is sitting idle, so it must never postpone staleness. An
+    /// earlier pass collapsed it into a generic fail-open heartbeat, which
+    /// refreshed `last_seen` and even un-staled an already-grey session —
+    /// letting an idle session stay green indefinitely, exactly the false
+    /// green this PRD exists to eliminate.
+    #[test]
+    fn idle_prompt_does_not_postpone_or_clear_staleness() {
+        let mut e = Engine::new(Duration::from_millis(0), Duration::from_secs(3600));
+        e.apply(&ev("UserPromptSubmit", "a"));
+        e.sweep();
+        assert!(e.snapshot()[0].stale, "went stale immediately (0 timeout)");
+        assert_eq!(e.rollup(), Rollup::Grey);
+
+        // An idle_prompt on an already-stale session must not un-stale it —
+        // unlike a real heartbeat event (see `stale_session_revives_on_next_event`).
+        let out = e.apply(&notif("a", "idle_prompt"));
+        assert!(
+            !out.changed,
+            "idle_prompt must not report a change (no last_seen touch)"
+        );
+        assert!(
+            e.snapshot()[0].stale,
+            "idle_prompt must not un-stale the row"
+        );
+        assert_eq!(
+            e.rollup(),
+            Rollup::Grey,
+            "still grey — not resurrected green"
+        );
     }
 
     #[test]
@@ -2733,5 +3343,266 @@ mod tests {
         assert!(wt, "flagged as a worktree");
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    // --- Waiting-for-review + subagent-backlog (this plan) -----------------
+
+    /// A main-agent `Stop` while subagents are still live must not report the
+    /// session ready — the tray would say "free" while agents keep running.
+    #[test]
+    fn stop_with_live_subagents_stays_working() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("UserPromptSubmit", "a"));
+        e.apply(&sub_ev("SubagentStart", "a"));
+        e.apply(&sub_ev("SubagentStart", "a"));
+        e.apply(&ev("Stop", "a"));
+        assert_eq!(state_of(&e, "a"), State::Working, "deferred, not lost");
+        assert_eq!(sub_count(&e, "a"), 2, "subagents still counted");
+    }
+
+    /// The deferred green fires the moment the LAST subagent leaves — not
+    /// before, and not never.
+    #[test]
+    fn last_subagent_stop_releases_the_deferred_green() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("UserPromptSubmit", "a"));
+        e.apply(&sub_ev("SubagentStart", "a"));
+        e.apply(&sub_ev("SubagentStart", "a"));
+        e.apply(&ev("Stop", "a"));
+        e.apply(&sub_ev("SubagentStop", "a"));
+        assert_eq!(
+            state_of(&e, "a"),
+            State::Working,
+            "one subagent still running"
+        );
+        e.apply(&sub_ev("SubagentStop", "a"));
+        assert_eq!(
+            state_of(&e, "a"),
+            State::Ready,
+            "last one releases the green"
+        );
+    }
+
+    /// A genuine block outranks a subagent backlog: the session must stay red
+    /// through the whole sequence, including the main agent's own `Stop` and
+    /// the eventual `SubagentStop` — a block is never mistaken for "finished".
+    #[test]
+    fn blocked_session_with_subagents_stays_red() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&notif("a", "permission_prompt"));
+        e.apply(&sub_ev("SubagentStart", "a"));
+        e.apply(&ev("Stop", "a"));
+        assert_eq!(state_of(&e, "a"), State::NeedsYou, "block outranks Stop");
+        e.apply(&sub_ev("SubagentStop", "a"));
+        assert_eq!(
+            state_of(&e, "a"),
+            State::NeedsYou,
+            "block outranks the deferred release too"
+        );
+    }
+
+    /// Without an owed transition (no main-agent `Stop` ever fired), a
+    /// subagent's own start/stop must never recolor the session — the locked
+    /// decision this plan narrows, not reverses.
+    #[test]
+    fn subagent_stop_without_owed_transition_does_not_recolor() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("UserPromptSubmit", "a"));
+        e.apply(&sub_ev("SubagentStart", "a"));
+        assert_eq!(state_of(&e, "a"), State::Working);
+        e.apply(&sub_ev("SubagentStop", "a"));
+        assert_eq!(
+            state_of(&e, "a"),
+            State::Working,
+            "no transition was owed — state is unchanged, not recomputed"
+        );
+    }
+
+    /// A session flagged for review lands in `WaitingReview`, not `Ready`,
+    /// the next time it finishes.
+    #[test]
+    fn flagged_session_finishes_into_waiting_review() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        e.set_review_flag("a", true);
+        e.apply(&ev("Stop", "a"));
+        assert_eq!(state_of(&e, "a"), State::WaitingReview);
+    }
+
+    /// The common case: an unflagged session still finishes into plain
+    /// `Ready`, exactly as before this plan.
+    #[test]
+    fn unflagged_session_still_finishes_ready() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        e.apply(&ev("Stop", "a"));
+        assert_eq!(state_of(&e, "a"), State::Ready);
+    }
+
+    /// The two features meet at exactly one seam: a flagged session with live
+    /// subagents defers to Working first, then resolves into WaitingReview
+    /// (not plain Ready) once the last subagent leaves.
+    #[test]
+    fn flagged_session_with_subagents_defers_then_reviews() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("UserPromptSubmit", "a"));
+        e.set_review_flag("a", true);
+        e.apply(&sub_ev("SubagentStart", "a"));
+        e.apply(&ev("Stop", "a"));
+        assert_eq!(state_of(&e, "a"), State::Working, "deferred first");
+        e.apply(&sub_ev("SubagentStop", "a"));
+        assert_eq!(
+            state_of(&e, "a"),
+            State::WaitingReview,
+            "resolves into the flagged terminal state, not plain Ready"
+        );
+    }
+
+    /// Clearing the flag before the session finishes restores plain `Ready`
+    /// — `terminal_state` always reads the CURRENT flag, not a snapshot taken
+    /// when it was set.
+    #[test]
+    fn clearing_the_flag_restores_ready() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        e.set_review_flag("a", true);
+        e.set_review_flag("a", false);
+        e.apply(&ev("Stop", "a"));
+        assert_eq!(state_of(&e, "a"), State::Ready);
+    }
+
+    /// Regression (manual-testing bug report): clearing the review flag on a
+    /// session that has ALREADY finished into `WaitingReview` must return it
+    /// to `Ready` immediately — not wait for another `Stop`, which may never
+    /// arrive again for an already-finished session. Before this fix the row
+    /// stayed on a stale red triangle after the user cleared the flag.
+    #[test]
+    fn clearing_the_flag_on_an_already_finished_session_returns_to_ready_now() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        e.set_review_flag("a", true);
+        e.apply(&ev("Stop", "a"));
+        assert_eq!(state_of(&e, "a"), State::WaitingReview);
+
+        e.set_review_flag("a", false);
+        assert_eq!(
+            state_of(&e, "a"),
+            State::Ready,
+            "clearing the flag must restore Ready instantly, with no further event needed"
+        );
+        assert_eq!(
+            e.rollup(),
+            Rollup::Green,
+            "the tray must reflect it instantly too"
+        );
+    }
+
+    /// Flagging (not clearing) a session that is currently sitting at plain
+    /// `Ready` must NOT jump it to `WaitingReview` — `Ready` is also a
+    /// brand-new session's resting state, and there's no way to tell "just
+    /// finished" apart from "hasn't started a turn yet" from state alone. The
+    /// flag only ever affects the session's NEXT finish in that direction.
+    #[test]
+    fn flagging_a_session_currently_at_ready_does_not_jump_state() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        assert_eq!(state_of(&e, "a"), State::Ready);
+        e.set_review_flag("a", true);
+        assert_eq!(
+            state_of(&e, "a"),
+            State::Ready,
+            "flagging alone must not recolor an already-Ready row"
+        );
+        e.apply(&ev("Stop", "a"));
+        assert_eq!(
+            state_of(&e, "a"),
+            State::WaitingReview,
+            "but the next finish honors it"
+        );
+    }
+
+    #[test]
+    fn rollup_prefers_needs_you_over_review() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&notif("blocked", "permission_prompt"));
+        e.apply(&ev("SessionStart", "reviewed"));
+        e.set_review_flag("reviewed", true);
+        e.apply(&ev("Stop", "reviewed"));
+        assert_eq!(e.rollup(), Rollup::Red, "NeedsYou still outranks Review");
+    }
+
+    #[test]
+    fn rollup_prefers_review_over_working() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("UserPromptSubmit", "working"));
+        e.apply(&ev("SessionStart", "reviewed"));
+        e.set_review_flag("reviewed", true);
+        e.apply(&ev("Stop", "reviewed"));
+        assert_eq!(e.rollup(), Rollup::Review, "Review outranks Working");
+    }
+
+    /// The review flag is per-run, not persisted: a `SessionEnd` followed by
+    /// a fresh `SessionStart` for the same id must not carry it over —
+    /// matches the plan's "keep it simple" decision.
+    #[test]
+    fn review_flag_clears_on_session_end() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        e.set_review_flag("a", true);
+        e.apply(&ev("SessionEnd", "a"));
+        e.apply(&ev("SessionStart", "a"));
+        e.apply(&ev("Stop", "a"));
+        assert_eq!(
+            state_of(&e, "a"),
+            State::Ready,
+            "flag did not survive the restart"
+        );
+    }
+
+    /// Unrecognised `notification_type` values — including the two named,
+    /// undocumented ones this plan explicitly declines to characterise, plus
+    /// an invented future one — must be treated as a plain heartbeat: state
+    /// unchanged, `last_seen` refreshed. This makes today's "falls into the
+    /// ignore bucket" behaviour deliberate rather than accidental.
+    #[test]
+    fn unknown_notification_types_fail_open() {
+        for ty in ["agent_completed", "agent_needs_input", "some_future_type"] {
+            let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+            e.apply(&ev("UserPromptSubmit", "a"));
+            let before = state_of(&e, "a");
+            let out = e.apply(&notif("a", ty));
+            assert_eq!(state_of(&e, "a"), before, "{ty} must not change state");
+            assert!(out.changed, "{ty} still refreshes last_seen (heartbeat)");
+        }
+    }
+
+    /// An unrecognised notification type must not be able to clear a flagged
+    /// session's `WaitingReview` — only a genuine restart clears the flag.
+    #[test]
+    fn unknown_notification_cannot_disturb_waiting_review() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("SessionStart", "a"));
+        e.set_review_flag("a", true);
+        e.apply(&ev("Stop", "a"));
+        assert_eq!(state_of(&e, "a"), State::WaitingReview);
+        e.apply(&notif("a", "agent_completed"));
+        assert_eq!(state_of(&e, "a"), State::WaitingReview);
+    }
+
+    /// An unrecognised notification type must not release a deferred
+    /// transition — only the matching `SubagentStop` may do that.
+    #[test]
+    fn unknown_notification_cannot_release_deferred_green() {
+        let mut e = Engine::new(Duration::from_secs(600), Duration::from_secs(3600));
+        e.apply(&ev("UserPromptSubmit", "a"));
+        e.apply(&sub_ev("SubagentStart", "a"));
+        e.apply(&ev("Stop", "a"));
+        assert_eq!(state_of(&e, "a"), State::Working);
+        e.apply(&notif("a", "agent_completed"));
+        assert_eq!(
+            state_of(&e, "a"),
+            State::Working,
+            "still deferred — only SubagentStop may release it"
+        );
     }
 }

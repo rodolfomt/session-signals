@@ -6,6 +6,7 @@
 //! listen for updates. State flows one way — engine → events → UI.
 
 pub mod capture;
+pub mod cli_alert;
 pub mod config;
 pub mod descriptor;
 pub mod engine;
@@ -30,7 +31,7 @@ use observe::Observations;
 use serde::Serialize;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_store::StoreExt;
 use tiny_http::Server;
@@ -309,11 +310,106 @@ mod tests {
     }
 }
 
-/// React to a state transition: fire a notification per the user's config.
+/// React to a state transition: alert on every enabled channel per the user's
+/// config.
+///
+/// Both channels fire here, on the edge. The CLI stub deliberately does *not*
+/// wait for the sweep's recurrence pass: the PRD's premise is that a stub runs
+/// when a status *rises*, and routing its first run through `due_alerts` would
+/// delay it by a full `cooldown_secs` (two minutes by default) and skip it
+/// entirely at `max_triggers: 1`. Firing here also makes `max_triggers` count
+/// the same events on both channels — see `engine::AlertPolicy::max_triggers`.
 fn on_transition(app: &AppHandle, t: &Transition) {
+    let cfg = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock_safe().clone();
+        cfg
+    };
+    app.state::<AppState>().notifier.fire(app, &cfg, t);
+    fire_stub(
+        &cfg,
+        t.to,
+        &t.session_id,
+        &t.folder,
+        t.branch.clone(),
+        t.descriptor.clone(),
+    );
+}
+
+/// Fire the CLI stub for `state`, if the user enabled that channel for it.
+/// Shared by the transition edge and the sweep's recurrence pass so the gating
+/// rule lives in one place and both paths pass identical arguments. Must be
+/// called with no locks held — `cli_alert::fire` hands off to a detached
+/// thread and returns immediately.
+fn fire_stub(
+    cfg: &Config,
+    state: engine::State,
+    session_id: &str,
+    folder: &str,
+    branch: Option<String>,
+    descriptor: Option<String>,
+) {
+    let pref = state_pref(cfg, state);
+    // `enabled` is the state's master switch (the same gate `Notifier::fire`
+    // applies to the OS channel); `cli_enabled` is this channel's own.
+    if !pref.enabled || !pref.cli_enabled {
+        return;
+    }
+    cli_alert::fire(cli_alert::StubInvocation {
+        session_id: session_id.to_string(),
+        state,
+        project: folder.to_string(),
+        branch,
+        descriptor,
+    });
+}
+
+/// The per-state notification preferences block for `state`.
+fn state_pref(cfg: &Config, state: engine::State) -> &config::StateNotify {
+    match state {
+        engine::State::NeedsYou => &cfg.needs_you,
+        engine::State::Working => &cfg.working,
+        engine::State::Ready => &cfg.ready,
+        engine::State::WaitingReview => &cfg.waiting_review,
+    }
+}
+
+/// Build the engine's recurrence policies from the live config. `engine.rs`
+/// never imports `crate::config` (architectural rule — see its file doc),
+/// so this is the one place the two shapes are bridged.
+fn alert_policies(cfg: &Config) -> engine::AlertPolicies {
+    let policy = |p: &config::StateNotify| engine::AlertPolicy {
+        enabled: p.enabled,
+        cooldown_secs: p.cooldown_secs,
+        max_triggers: p.max_triggers,
+    };
+    engine::AlertPolicies {
+        needs_you: policy(&cfg.needs_you),
+        working: policy(&cfg.working),
+        ready: policy(&cfg.ready),
+        waiting_review: policy(&cfg.waiting_review),
+    }
+}
+
+/// Deliver one due re-alert on both channels — OS notification and CLI
+/// stub — each independently gated by its own per-state preference. Must be
+/// called with no locks held: `Notifier::fire_repeat` and `cli_alert::fire`
+/// each hand off to a detached thread and return immediately, but neither
+/// touches the engine or config lock, so the caller must have already
+/// dropped both before invoking this.
+fn deliver_alert(app: &AppHandle, cfg: &Config, req: &engine::AlertRequest) {
     let state = app.state::<AppState>();
-    let cfg = state.config.lock_safe().clone();
-    state.notifier.fire(app, &cfg, t);
+    // OS channel: `fire_repeat` re-checks `pref.enabled` itself (and applies
+    // focus suppression + debounce), so no gate is needed here.
+    state.notifier.fire_repeat(app, cfg, req);
+    fire_stub(
+        cfg,
+        req.state,
+        &req.session_id,
+        &req.folder,
+        req.branch.clone(),
+        req.descriptor.clone(),
+    );
 }
 
 /// Apply one hook event and propagate its effects. Runs on the `beacon-events`
@@ -846,6 +942,19 @@ fn set_tray_palette(app: AppHandle, palette: TrayPalette) {
     refresh(&app);
 }
 
+/// Set (or clear) a session's review flag: its next terminal transition lands
+/// in `WaitingReview` instead of `Ready`. The widget's per-row toggle — the
+/// app's first user→engine command. A no-op on an unknown session id.
+#[tauri::command]
+fn set_review_flag(app: AppHandle, session_id: String, flag: bool) {
+    {
+        let state = app.state::<AppState>();
+        let mut eng = state.engine.lock_safe();
+        eng.set_review_flag(&session_id, flag);
+    }
+    refresh(&app);
+}
+
 #[tauri::command]
 fn install_hooks(app: AppHandle) -> Result<String, String> {
     install_beacon_hooks(&app).map(|p| p.display().to_string())
@@ -889,6 +998,47 @@ fn regenerate_token(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn endpoint(app: AppHandle) -> String {
     hooks::endpoint(current_port(&app))
+}
+
+/// Whether an external alert stub is currently resolvable for each state —
+/// read fresh on every call (no caching) so Settings always reflects the
+/// live contents of the `alerts/` folder.
+#[derive(Serialize)]
+struct AlertStubStatus {
+    needs_you: bool,
+    working: bool,
+    ready: bool,
+    waiting_review: bool,
+}
+
+#[tauri::command]
+fn alert_stub_status() -> AlertStubStatus {
+    AlertStubStatus {
+        needs_you: cli_alert::stub_for(engine::State::NeedsYou).is_some(),
+        working: cli_alert::stub_for(engine::State::Working).is_some(),
+        ready: cli_alert::stub_for(engine::State::Ready).is_some(),
+        waiting_review: cli_alert::stub_for(engine::State::WaitingReview).is_some(),
+    }
+}
+
+/// Fire the stub for `state` immediately, with placeholder args — the
+/// Settings "test" button. Returns a short outcome string ("fired" /
+/// "no_stub" / "busy") rather than a bool so the UI can distinguish "nothing
+/// to run" from "already running" without a second round trip.
+#[tauri::command]
+fn test_alert_stub(state: engine::State) -> String {
+    let outcome = cli_alert::fire(cli_alert::StubInvocation {
+        session_id: "test".to_string(),
+        state,
+        project: "Session Signals".to_string(),
+        branch: None,
+        descriptor: Some("Manual test from Settings".to_string()),
+    });
+    match outcome {
+        cli_alert::FireOutcome::Fired => "fired".to_string(),
+        cli_alert::FireOutcome::NoStub => "no_stub".to_string(),
+        cli_alert::FireOutcome::Busy => "busy".to_string(),
+    }
 }
 
 /// Raise the terminal window that owns `session_id`, if Session Signals captured it.
@@ -1032,7 +1182,10 @@ pub fn run() {
             hook_block,
             regenerate_token,
             endpoint,
+            alert_stub_status,
+            test_alert_stub,
             focus_session,
+            set_review_flag,
             widget_prefs,
             widget_set_compact,
             widget_set_compact_width,
@@ -1168,6 +1321,12 @@ pub fn run() {
                 })?;
             *handle.state::<AppState>().listener.lock_safe() = Some(server);
 
+            // Resolve and create the alerts/ folder (with its README) so it's
+            // there for the user to drop a stub into from the first run,
+            // before any alert could possibly fire. Also the one call that
+            // makes `cli_alert::alerts_dir()` resolvable at all.
+            cli_alert::init(&handle);
+
             // Background stale sweep. Newly-stale sessions may notify if the
             // user enabled idle notifications.
             let sweep_handle = handle.clone();
@@ -1201,6 +1360,25 @@ pub fn run() {
                                     notify_idle(sweep_handle, label);
                                 }
                             }
+                        }
+                        // Recurring re-alerts for sessions stuck in
+                        // NeedsYou/WaitingReview. The config snapshot and
+                        // due-alert list are both computed and their locks
+                        // dropped before any delivery, matching the "never
+                        // hold a lock during delivery" rule `deliver_alert`
+                        // documents.
+                        let cfg = {
+                            let state = sweep_handle.state::<AppState>();
+                            let cfg = state.config.lock_safe().clone();
+                            cfg
+                        };
+                        let due = {
+                            let state = sweep_handle.state::<AppState>();
+                            let mut eng = state.engine.lock_safe();
+                            eng.due_alerts(&alert_policies(&cfg), Instant::now())
+                        };
+                        for req in &due {
+                            deliver_alert(sweep_handle, &cfg, req);
                         }
                         // Prune expired observation records and flush to disk
                         // on this same heartbeat tick — piggybacking on the

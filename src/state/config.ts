@@ -6,6 +6,24 @@ export interface StateNotify {
   enabled: boolean;
   sound: boolean;
   sound_name: string;
+  /// Whether this state's CLI stub in the `alerts/` folder is eligible to run.
+  /// Gated by `enabled` like every other channel. Harmless when true with no
+  /// stub present — an absent stub is a no-op.
+  cli_enabled: boolean;
+  /// Seconds between re-alerts while a session stays in this state. One knob:
+  /// both the minimum cooldown between re-triggers and the recurrence interval.
+  /// `0` disables recurrence (fire once on the transition edge). Non-zero values
+  /// are floored at 10 by the backend's `sanitized()`, not enforced here.
+  ///
+  /// Only meaningful for `needs_you` and `waiting_review`. `working`/`ready`
+  /// churn via their own hook events and never recur — the backend hands back a
+  /// disabled policy for them (`engine::AlertPolicies::for_state`), so Settings
+  /// should not offer recurrence controls for those two states.
+  cooldown_secs: number;
+  /// Maximum total alerts per state-episode, counting the transition-edge fire
+  /// that both channels deliver — so `1` is single-shot. Clamped to 1..=20 by
+  /// the backend. Same two-state caveat as `cooldown_secs`.
+  max_triggers: number;
 }
 
 /// One session-ignore matcher. Mirrors the serde-tagged Rust `ignore::Matcher`
@@ -40,6 +58,9 @@ export interface Config {
   needs_you: StateNotify;
   working: StateNotify;
   ready: StateNotify;
+  /// Notification preference for `waiting_review` (a flagged session
+  /// finished). Enabled, no sound by default — mirrors `needs_you`.
+  waiting_review: StateNotify;
   /// Rules that hide non-interactive / machine-spawned sessions from the widget
   /// and tray rollup. Editable from the Settings → "Session filtering" section
   /// (`RuleList`), which writes back through `set_config` like every other
@@ -77,9 +98,42 @@ export const DEFAULT_CONFIG: Config = {
   notify_idle: false,
   notify_unfocused_only: true,
   theme: "classic",
-  needs_you: { enabled: true, sound: false, sound_name: "Ping" },
-  working: { enabled: false, sound: false, sound_name: "Pop" },
-  ready: { enabled: false, sound: false, sound_name: "Glass" },
+  // Alerting defaults are uniform across all four states (see the Rust
+  // `StateNotify::new` — serde's per-field default can't vary by state, so a
+  // differentiated default would migrate old configs wrong). Per-state
+  // differentiation lives in `enabled`.
+  needs_you: {
+    enabled: true,
+    sound: false,
+    sound_name: "Ping",
+    cli_enabled: true,
+    cooldown_secs: 120,
+    max_triggers: 3,
+  },
+  working: {
+    enabled: false,
+    sound: false,
+    sound_name: "Pop",
+    cli_enabled: true,
+    cooldown_secs: 120,
+    max_triggers: 3,
+  },
+  ready: {
+    enabled: false,
+    sound: false,
+    sound_name: "Glass",
+    cli_enabled: true,
+    cooldown_secs: 120,
+    max_triggers: 3,
+  },
+  waiting_review: {
+    enabled: true,
+    sound: false,
+    sound_name: "Ping",
+    cli_enabled: true,
+    cooldown_secs: 120,
+    max_triggers: 3,
+  },
   // Mirrors Rust `ignore::IgnoreRules::defaults()` — empty. Session Signals
   // hides nothing until the user opts in. Keeping this empty also means a save
   // landing before the initial `get_config` resolves can never resurrect rules

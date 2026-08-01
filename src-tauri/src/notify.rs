@@ -7,7 +7,7 @@
 //! transitions within a short window to collapse rapid storms.
 
 use crate::config::Config;
-use crate::engine::{State, Transition};
+use crate::engine::{AlertRequest, State, Transition};
 use crate::tray::TrayPalette;
 use crate::LockExt;
 use std::collections::HashMap;
@@ -21,11 +21,16 @@ use tauri_plugin_notification::NotificationExt;
 /// OS notification, which displays at a higher resolution than the menu bar.
 const NOTIF_ICON_SIZE: u32 = 64;
 
-fn state_slug(state: State) -> &'static str {
+/// Canonical lowercase slug for a state. Single source of truth for three
+/// surfaces that must never drift apart: the themed notification icon
+/// filenames, the `alerts/` stub filenames (`on_{slug}`), and the first
+/// positional argument handed to a stub.
+pub(crate) fn state_slug(state: State) -> &'static str {
     match state {
         State::NeedsYou => "needs_you",
         State::Working => "working",
         State::Ready => "ready",
+        State::WaitingReview => "waiting_review",
     }
 }
 
@@ -57,6 +62,11 @@ pub fn render_icons(app: &AppHandle, palette: &TrayPalette) {
         ),
         (State::Working, palette.working, crate::glyph::Shape::Dot),
         (State::Ready, palette.ready, crate::glyph::Shape::Check),
+        (
+            State::WaitingReview,
+            palette.waiting_review,
+            crate::glyph::Shape::Triangle,
+        ),
     ] {
         let rgba = crate::glyph::render_glyph_rgba(shape, rgb, NOTIF_ICON_SIZE);
         if let (Some(png), Some(path)) = (
@@ -91,6 +101,7 @@ impl Notifier {
             State::NeedsYou => &cfg.needs_you,
             State::Working => &cfg.working,
             State::Ready => &cfg.ready,
+            State::WaitingReview => &cfg.waiting_review,
         };
         if !pref.enabled {
             return;
@@ -138,6 +149,10 @@ impl Notifier {
                 "Running — don’t interrupt.",
             ),
             State::Ready => (format!("{project} is ready"), "Finished — your turn."),
+            State::WaitingReview => (
+                format!("{project} is waiting for review"),
+                "Finished — you asked to review this one.",
+            ),
         };
         let sound = if pref.sound {
             Some(pref.sound_name.clone())
@@ -161,5 +176,26 @@ impl Notifier {
             }
             let _ = builder.show();
         });
+    }
+
+    /// Fire a recurring re-alert for a session still stuck in the same
+    /// state — the sweep-driven counterpart to `fire`, which only reacts to
+    /// a genuine transition. Reuses `fire`'s full body (focus suppression,
+    /// debounce, sound/icon selection) via a synthesized `Transition` with
+    /// `from == Some(to)`: nothing in `fire` branches on `from`, so a
+    /// same-state "transition" fires exactly like a real one for the
+    /// target state.
+    pub fn fire_repeat(&self, app: &AppHandle, cfg: &Config, req: &AlertRequest) {
+        let t = Transition {
+            session_id: req.session_id.clone(),
+            label: req.label.clone(),
+            folder: req.folder.clone(),
+            branch: req.branch.clone(),
+            descriptor: req.descriptor.clone(),
+            from: Some(req.state),
+            to: req.state,
+            terminal_pid: req.terminal_pid,
+        };
+        self.fire(app, cfg, &t);
     }
 }

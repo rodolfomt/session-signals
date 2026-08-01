@@ -50,17 +50,55 @@ pub const MIN_PROPOSE_THRESHOLD: u32 = 3;
 /// colliding, which is the case this floor actually guards.
 pub const MIN_PROPOSE_SAMPLE_LEN: usize = 60;
 
+/// Default seconds between re-alerts while a session sits in an alerting state
+/// (feat03 external alerting). Two minutes: long enough not to be a nuisance for
+/// a state you've already noticed, short enough to catch you on a return to the
+/// desk. One knob — cooldown and recurrence interval are the same number.
+pub const DEFAULT_ALERT_COOLDOWN_SECS: u64 = 120;
+/// Floor for a *non-zero* `cooldown_secs`. `0` is legal and means "no recurrence";
+/// anything between 1 and this is clamped up. Guards against a hand-edited
+/// `beacon.json` turning the recurrence sweep into a per-second subprocess spawner.
+pub const MIN_ALERT_COOLDOWN_SECS: u64 = 10;
+/// Default maximum alerts per state-episode, counting the initial transition fire.
+/// Three: the original alert plus two nudges, then silence until the state changes.
+pub const DEFAULT_MAX_TRIGGERS: u32 = 3;
+/// Hard ceiling on `max_triggers`. An episode that has alerted this many times has
+/// made its point; past here it's noise, and an unbounded value hand-edited into
+/// the config would keep a stuck session alerting indefinitely.
+pub const MAX_ALERT_TRIGGERS: u32 = 20;
+
 /// Built-in notification sounds (macOS system sound names under
 /// `/System/Library/Sounds`). The settings UI offers this set.
 pub const SOUNDS: &[&str] = &["Ping", "Glass", "Submarine", "Funk", "Pop", "Hero"];
 
 /// Per-state notification preference.
+///
+/// Beyond the OS notification + sound, this also carries the external-alerting
+/// settings (feat03): whether the state's CLI stub is eligible to run, and the
+/// shared cooldown/recurrence controls that apply uniformly to *both* the sound
+/// and the CLI channel.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct StateNotify {
     pub enabled: bool,
     pub sound: bool,
     pub sound_name: String,
+    /// Whether this state's CLI stub in the `alerts/` folder is eligible to run.
+    /// Gated by `enabled` like every other channel — a state that doesn't notify
+    /// at all never spawns a stub. Harmless when `true` with no stub present:
+    /// an absent stub is a no-op, not an error (see Phase 2).
+    pub cli_enabled: bool,
+    /// Seconds between re-alerts while a session stays in this state. One knob:
+    /// this is both the minimum cooldown between re-triggers *and* the recurrence
+    /// interval — they were never two independent things. `0` disables recurrence
+    /// entirely (fire once on the transition edge, today's behavior). Floored at
+    /// [`MIN_ALERT_COOLDOWN_SECS`] when non-zero.
+    pub cooldown_secs: u64,
+    /// Maximum total alerts per state-episode, **including** the initial
+    /// transition fire. `1` is exactly today's single-shot behavior; the counter
+    /// resets when the session's state changes. Clamped to
+    /// `1..=MAX_ALERT_TRIGGERS`.
+    pub max_triggers: u32,
 }
 
 impl StateNotify {
@@ -69,6 +107,9 @@ impl StateNotify {
             enabled,
             sound: false,
             sound_name: sound_name.to_string(),
+            cli_enabled: true,
+            cooldown_secs: DEFAULT_ALERT_COOLDOWN_SECS,
+            max_triggers: DEFAULT_MAX_TRIGGERS,
         }
     }
 }
@@ -106,6 +147,12 @@ pub struct Config {
     pub needs_you: StateNotify,
     pub working: StateNotify,
     pub ready: StateNotify,
+    /// Notification preference for `State::WaitingReview` (a flagged session
+    /// finished). Enabled, no sound by default — matches `needs_you`. Plain
+    /// `#[serde(default)]` at the struct level is enough: a config file
+    /// written before this field existed deserializes it from
+    /// `Config::default()` below, so no `CURRENT_VERSION` bump is needed.
+    pub waiting_review: StateNotify,
     /// Rules that hide non-interactive / machine-spawned sessions (e.g. headless
     /// `claude --print` agents launched by third-party tooling) from the widget
     /// and tray rollup.
@@ -172,6 +219,7 @@ impl Default for Config {
             needs_you: StateNotify::new(true, "Ping"),
             working: StateNotify::new(false, "Pop"),
             ready: StateNotify::new(false, "Glass"),
+            waiting_review: StateNotify::new(true, "Ping"),
             ignore_rules: crate::ignore::IgnoreRules::defaults(),
             never_hide: Vec::new(),
             markers: Vec::new(),
@@ -206,6 +254,22 @@ impl Config {
         }
         if self.propose_threshold < MIN_PROPOSE_THRESHOLD {
             self.propose_threshold = MIN_PROPOSE_THRESHOLD;
+        }
+        // Normalize the per-state alerting knobs. A `cooldown_secs` of 0 is legal and
+        // means "no recurrence" — only non-zero values get floored, so an existing
+        // config can't be silently opted into repeat alerts. `max_triggers` of 0 would
+        // mean "never alert", which `enabled: false` already expresses, so it clamps to
+        // 1 (today's single-shot behavior) rather than creating a second off-switch.
+        for pref in [
+            &mut self.needs_you,
+            &mut self.working,
+            &mut self.ready,
+            &mut self.waiting_review,
+        ] {
+            if pref.cooldown_secs > 0 && pref.cooldown_secs < MIN_ALERT_COOLDOWN_SECS {
+                pref.cooldown_secs = MIN_ALERT_COOLDOWN_SECS;
+            }
+            pref.max_triggers = pref.max_triggers.clamp(1, MAX_ALERT_TRIGGERS);
         }
         self.version = CURRENT_VERSION;
         self
@@ -265,6 +329,31 @@ mod tests {
         assert_eq!(cfg.propose_threshold, DEFAULT_PROPOSE_THRESHOLD);
     }
 
+    /// A config written before `waiting_review` existed must still load, with
+    /// the field filling in from its default (enabled, no sound — matching
+    /// `needs_you`) rather than aborting the whole parse.
+    #[test]
+    fn old_config_without_waiting_review_still_loads() {
+        let json = serde_json::json!({
+            "version": 1,
+            "port": 4317,
+            "stale_timeout_min": 10,
+            "idle_drop_min": 60,
+            "launch_on_login": false,
+            "notify_idle": false,
+            "notify_unfocused_only": true,
+            "theme": "classic",
+            "needs_you": { "enabled": true, "sound": false, "sound_name": "Ping" },
+            "working": { "enabled": false, "sound": false, "sound_name": "Pop" },
+            "ready": { "enabled": false, "sound": false, "sound_name": "Glass" },
+            "ignore_rules": []
+        });
+        let cfg: Config = serde_json::from_value(json).expect("old config must still parse");
+        let cfg = cfg.sanitized();
+        assert!(cfg.waiting_review.enabled);
+        assert!(!cfg.waiting_review.sound);
+    }
+
     #[test]
     fn zero_observe_retain_days_sanitizes_to_default() {
         let mut cfg = Config {
@@ -285,5 +374,113 @@ mod tests {
             .sanitized();
             assert_eq!(cfg.propose_threshold, expected, "input {input}");
         }
+    }
+
+    /// A config written before external alerting existed (no `cli_enabled`,
+    /// `cooldown_secs`, `max_triggers` on the per-state objects) must still
+    /// load, with each state's new keys filling in from `StateNotify::default()`
+    /// rather than aborting the parse or zeroing out the recurrence settings.
+    #[test]
+    fn old_config_without_alert_fields_still_loads() {
+        let json = serde_json::json!({
+            "version": 1,
+            "port": 4317,
+            "stale_timeout_min": 10,
+            "idle_drop_min": 60,
+            "launch_on_login": false,
+            "notify_idle": false,
+            "notify_unfocused_only": true,
+            "theme": "classic",
+            "needs_you": { "enabled": true, "sound": false, "sound_name": "Ping" },
+            "working": { "enabled": false, "sound": false, "sound_name": "Pop" },
+            "ready": { "enabled": false, "sound": false, "sound_name": "Glass" },
+            "waiting_review": { "enabled": true, "sound": false, "sound_name": "Ping" },
+            "ignore_rules": []
+        });
+        let cfg: Config = serde_json::from_value(json).expect("old config must still parse");
+        let cfg = cfg.sanitized();
+        for pref in [
+            &cfg.needs_you,
+            &cfg.working,
+            &cfg.ready,
+            &cfg.waiting_review,
+        ] {
+            assert!(pref.cli_enabled);
+            assert_eq!(pref.cooldown_secs, DEFAULT_ALERT_COOLDOWN_SECS);
+            assert_eq!(pref.max_triggers, DEFAULT_MAX_TRIGGERS);
+        }
+        // The pre-existing fields must survive the migration untouched.
+        assert!(cfg.needs_you.enabled);
+        assert_eq!(cfg.ready.sound_name, "Glass");
+    }
+
+    /// `0` means "no recurrence" and must survive sanitization; any other
+    /// sub-floor value is clamped up so a hand-edited config can't spawn alerts
+    /// every second.
+    #[test]
+    fn cooldown_secs_floor_applies_only_to_nonzero() {
+        for (input, expected) in [
+            (0, 0),
+            (1, MIN_ALERT_COOLDOWN_SECS),
+            (9, MIN_ALERT_COOLDOWN_SECS),
+            (10, 10),
+            (300, 300),
+        ] {
+            let cfg = Config {
+                needs_you: StateNotify {
+                    cooldown_secs: input,
+                    ..StateNotify::default()
+                },
+                ..Config::default()
+            }
+            .sanitized();
+            assert_eq!(cfg.needs_you.cooldown_secs, expected, "input {input}");
+        }
+    }
+
+    /// `max_triggers` clamps into `1..=MAX_ALERT_TRIGGERS`: 0 would duplicate
+    /// `enabled: false`, and an unbounded value would alert forever.
+    #[test]
+    fn max_triggers_clamps_into_range() {
+        for (input, expected) in [
+            (0, 1),
+            (1, 1),
+            (3, 3),
+            (MAX_ALERT_TRIGGERS, MAX_ALERT_TRIGGERS),
+            (9_999, MAX_ALERT_TRIGGERS),
+        ] {
+            let cfg = Config {
+                waiting_review: StateNotify {
+                    max_triggers: input,
+                    ..StateNotify::default()
+                },
+                ..Config::default()
+            }
+            .sanitized();
+            assert_eq!(cfg.waiting_review.max_triggers, expected, "input {input}");
+        }
+    }
+
+    /// Defaults are uniform across all four states by design: `serde(default)`
+    /// fills a missing key from a single `StateNotify::default()` with no idea
+    /// which state it belongs to, so differentiated defaults would migrate old
+    /// configs to values a fresh install would never produce. Per-state behavior
+    /// differentiation lives in `enabled`, not in the recurrence knobs.
+    #[test]
+    fn alert_defaults_are_uniform_across_states() {
+        let cfg = Config::default();
+        for pref in [
+            &cfg.needs_you,
+            &cfg.working,
+            &cfg.ready,
+            &cfg.waiting_review,
+        ] {
+            assert_eq!(pref.cooldown_secs, DEFAULT_ALERT_COOLDOWN_SECS);
+            assert_eq!(pref.max_triggers, DEFAULT_MAX_TRIGGERS);
+            assert!(pref.cli_enabled);
+        }
+        // ...while the existing per-state gate stays differentiated.
+        assert!(cfg.needs_you.enabled);
+        assert!(!cfg.working.enabled);
     }
 }

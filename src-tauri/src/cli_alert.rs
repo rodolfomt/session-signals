@@ -1,0 +1,380 @@
+//! External CLI alert channel: invoke a user-authored executable from the
+//! fixed `alerts/` folder in the app-data dir (see [`alerts_dir`]) when a
+//! session enters — or stays in — an alerting state.
+//!
+//! **Deliberately convention-based, not configurable.** There is no path
+//! field and no argv configuration. Only a fixed filename in that fixed
+//! folder with a recognized extension is eligible to run, and it always
+//! receives the same four positional arguments in the same order. That closes
+//! the argument-injection and arbitrary-path surface a free-text "command to
+//! run" setting would open — see the PRD's Decisions Log.
+//!
+//! Arguments never pass through a shell we invoke. The one platform exception
+//! is outside our control: Windows can only launch `.bat`/`.cmd` via
+//! `cmd.exe`, so std routes those through it. Since Rust 1.77 std escapes the
+//! arguments for that case, and refuses the launch outright when an argument
+//! can't be represented safely (CVE-2024-24576) — a failed spawn, never a
+//! mis-parsed one. `.exe` stubs are unaffected.
+//!
+//! Privacy: this is a local process spawn. Session Signals makes no network
+//! call here and never will (CLAUDE.md guardrail). What the *user's own stub*
+//! does is the user's business.
+
+use crate::engine::State;
+use crate::notify::state_slug;
+use crate::LockExt;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Manager};
+
+/// Folder name, resolved inside the app-data dir.
+const ALERTS_DIR: &str = "alerts";
+/// A stub still running after this long is killed. Alert stubs are meant to be
+/// brief (open a notification app, play a sound, ping a webhook) — this guards
+/// against a hung stub silently blocking future alerts for its (session, state)
+/// key forever.
+const MAX_STUB_RUNTIME: Duration = Duration::from_secs(30);
+/// Poll interval while waiting for a spawned stub to exit.
+const REAP_POLL: Duration = Duration::from_millis(100);
+
+/// Recognized stub extensions, in precedence order (first match wins), per
+/// platform — matches what the OS can execute directly without a shell.
+fn stub_extensions() -> &'static [&'static str] {
+    if cfg!(target_os = "windows") {
+        &["exe", "bat", "cmd"]
+    } else if cfg!(target_os = "macos") {
+        &["sh", "command"]
+    } else {
+        &["sh"]
+    }
+}
+
+/// Resolved once at startup by [`init`]. `None` before that (and in unit
+/// tests, which drive `resolve_in` against a scratch dir directly).
+static ALERTS_DIR_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// The `alerts/` folder — inside the app-data dir, alongside `beacon.json`
+/// and the capture script.
+///
+/// **Not next to the executable.** An installed app's own directory is
+/// `C:\Program Files\...` on Windows, `/usr/bin` on Linux, and *inside the
+/// signed `.app` bundle* on macOS: unwritable without admin, invisible to a
+/// user who just wants to drop a script somewhere, and on macOS both
+/// signature-breaking and erased by every update. The app-data dir is
+/// user-writable and survives upgrades, which is the whole point of a folder
+/// the user is expected to put files into.
+///
+/// `None` only if [`init`] hasn't run or the platform dir couldn't be
+/// resolved — in which case no stub ever resolves, which degrades to "no CLI
+/// alerts configured" rather than to an error.
+pub fn alerts_dir() -> Option<PathBuf> {
+    ALERTS_DIR_PATH.get().cloned()
+}
+
+/// Candidate filenames for `state`, in extension-precedence order.
+pub fn stub_filenames(state: State) -> Vec<String> {
+    let slug = state_slug(state);
+    stub_extensions()
+        .iter()
+        .map(|ext| format!("on_{slug}.{ext}"))
+        .collect()
+}
+
+/// Resolve the first existing stub file for `state` inside `dir`, honoring
+/// extension precedence. A directory that happens to share a stub's name is
+/// not a match (`is_file` excludes it).
+pub fn resolve_in(dir: &Path, state: State) -> Option<PathBuf> {
+    stub_filenames(state)
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Resolve the stub for `state` in the real `alerts_dir()`.
+pub fn stub_for(state: State) -> Option<PathBuf> {
+    resolve_in(&alerts_dir()?, state)
+}
+
+/// Resolve the `alerts/` folder inside the app-data dir, create it, and seed
+/// its README. Call once from `setup`, before any alert could fire.
+///
+/// Failures are logged, not fatal: without the folder no stub resolves, which
+/// is indistinguishable from "no alerts configured" — a degraded feature, not
+/// a broken app. But unlike the previous silent version, a user wondering why
+/// nothing runs has a line to find.
+pub fn init(app: &AppHandle) {
+    let base = match app.path().app_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("beacon: no app data dir; CLI alerts disabled: {e}");
+            return;
+        }
+    };
+    let dir = base.join(ALERTS_DIR);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!(
+            "beacon: could not create {}; CLI alerts disabled: {e}",
+            dir.display()
+        );
+        return;
+    }
+    let readme = dir.join("README.txt");
+    if !readme.exists() {
+        let _ = std::fs::write(&readme, README_TEXT);
+    }
+    let _ = ALERTS_DIR_PATH.set(dir);
+}
+
+const README_TEXT: &str = "\
+Session Signals — external alert stubs
+======================================
+
+Drop an executable here named for the state it should react to:
+
+    on_needs_you.<ext>        a session is blocked on you
+    on_waiting_review.<ext>   a flagged session finished
+    on_working.<ext>          a session started working
+    on_ready.<ext>            a session finished its turn
+
+Recognized extensions, in precedence order (first match wins):
+    Windows:  .exe  .bat  .cmd
+    macOS:    .sh   .command
+    Linux:    .sh
+
+Your stub is invoked with exactly four positional arguments, always in
+this order. Absent values are passed as an empty string, never skipped:
+
+    $1  state       e.g. needs_you
+    $2  project     the session's folder name
+    $3  branch      git branch, or \"\" if not resolvable
+    $4  descriptor  the session's title / first prompt, or \"\"
+
+Arguments are passed directly, never through a shell, so values with
+spaces arrive intact as a single argument and nothing is re-split or
+expanded. (One platform caveat: Windows runs .bat and .cmd files via
+cmd.exe by necessity — arguments are still escaped for you, but an
+argument cmd.exe cannot represent safely will make the launch fail
+rather than run something unintended. A .exe has no such caveat.)
+
+No environment variables are set. Output is discarded. A stub still
+running after 30 seconds is killed.
+
+Alerts must also be enabled for that state in Settings.
+";
+
+/// Concurrency guard: which `session:state` keys currently have a stub in
+/// flight. Prevents a slow stub from overlapping with itself on repeated
+/// recurrence fires.
+static IN_FLIGHT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+fn in_flight_key(session_id: &str, state: State) -> String {
+    format!("{}:{}", session_id, state_slug(state))
+}
+
+/// Claim the key for this invocation. Returns `false` if already in flight.
+fn claim(key: &str) -> bool {
+    let mut guard = IN_FLIGHT.lock_safe();
+    guard
+        .get_or_insert_with(HashSet::new)
+        .insert(key.to_string())
+}
+
+fn release(key: &str) {
+    let mut guard = IN_FLIGHT.lock_safe();
+    if let Some(set) = guard.as_mut() {
+        set.remove(key);
+    }
+}
+
+/// Everything `fire` needs to build the four positional arguments and resolve
+/// the concurrency-guard key. Caller (the engine/sweep-thread dispatch) is
+/// responsible for gating this on the state's `cli_enabled` preference first.
+#[derive(Clone, Debug)]
+pub struct StubInvocation {
+    pub session_id: String,
+    pub state: State,
+    pub project: String,
+    pub branch: Option<String>,
+    pub descriptor: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum FireOutcome {
+    /// A stub was resolved and a detached thread was spawned to run it.
+    Fired,
+    /// No stub file exists for this state — a silent no-op, not an error.
+    NoStub,
+    /// A stub for this exact (session, state) is already running.
+    Busy,
+}
+
+/// Resolve and spawn the stub for `inv.state`, if any, on a detached thread.
+/// Never blocks the caller: the spawn + reap + timeout-kill all happen off
+/// the calling thread, so this must be called with no locks held.
+pub fn fire(inv: StubInvocation) -> FireOutcome {
+    let Some(path) = stub_for(inv.state) else {
+        return FireOutcome::NoStub;
+    };
+    let key = in_flight_key(&inv.session_id, inv.state);
+    if !claim(&key) {
+        return FireOutcome::Busy;
+    }
+
+    let args = [
+        state_slug(inv.state).to_string(),
+        inv.project,
+        inv.branch.unwrap_or_default(),
+        inv.descriptor.unwrap_or_default(),
+    ];
+
+    let key_for_thread = key.clone();
+    let spawned_thread = std::thread::Builder::new()
+        .name("beacon-alert-stub".into())
+        .spawn(move || {
+            let key = key_for_thread;
+            let spawned = Command::new(&path)
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+
+            match spawned {
+                Ok(mut child) => {
+                    let started = Instant::now();
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) => {
+                                if started.elapsed() >= MAX_STUB_RUNTIME {
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    eprintln!(
+                                        "beacon: alert stub {} exceeded {}s; killed",
+                                        path.display(),
+                                        MAX_STUB_RUNTIME.as_secs()
+                                    );
+                                    break;
+                                }
+                                std::thread::sleep(REAP_POLL);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                Err(e) => {
+                    // On Windows this is also how an argument cmd.exe can't
+                    // safely represent surfaces for a .bat/.cmd stub — the launch
+                    // is refused rather than mis-escaped. Worth naming, since the
+                    // descriptor argument is free-form text.
+                    eprintln!(
+                        "beacon: failed to launch alert stub {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+            release(&key);
+        });
+
+    // If the thread itself couldn't start, nothing will ever release the
+    // claim — that would wedge this (session, state) on `Busy` for the rest
+    // of the process's life.
+    if let Err(e) = spawned_thread {
+        release(&key);
+        eprintln!("beacon: could not start alert-stub thread: {e}");
+        return FireOutcome::NoStub;
+    }
+
+    FireOutcome::Fired
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "beacon-cli-alert-test-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn stub_filenames_follow_the_on_state_convention() {
+        let names = stub_filenames(State::NeedsYou);
+        for name in &names {
+            assert!(name.starts_with("on_needs_you."));
+        }
+    }
+
+    #[test]
+    fn extension_precedence_is_platform_correct() {
+        let names = stub_filenames(State::Ready);
+        let expected: Vec<String> = stub_extensions()
+            .iter()
+            .map(|ext| format!("on_ready.{ext}"))
+            .collect();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn missing_folder_and_missing_stub_resolve_to_none() {
+        let dir = scratch_dir("missing");
+        assert_eq!(resolve_in(&dir, State::Working), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_in_finds_a_stub_and_honors_precedence() {
+        let dir = scratch_dir("precedence");
+        // On Windows the precedence order is exe, bat, cmd — write the
+        // lower-precedence one first, then the higher-precedence one, and
+        // confirm the higher-precedence file wins.
+        let exts = stub_extensions();
+        let low = dir.join(format!("on_waiting_review.{}", exts[exts.len() - 1]));
+        std::fs::write(&low, "").unwrap();
+        let high = dir.join(format!("on_waiting_review.{}", exts[0]));
+        std::fs::write(&high, "").unwrap();
+
+        let resolved = resolve_in(&dir, State::WaitingReview);
+        assert_eq!(resolved, Some(high));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_named_like_a_stub_is_not_a_stub() {
+        let dir = scratch_dir("dir-not-file");
+        let exts = stub_extensions();
+        let fake = dir.join(format!("on_needs_you.{}", exts[0]));
+        std::fs::create_dir_all(&fake).unwrap();
+
+        assert_eq!(resolve_in(&dir, State::NeedsYou), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn in_flight_guard_blocks_only_the_same_session_and_state() {
+        let key_a = in_flight_key("session-a", State::NeedsYou);
+        let key_b = in_flight_key("session-b", State::NeedsYou);
+        let key_c = in_flight_key("session-a", State::Working);
+
+        assert!(claim(&key_a));
+        assert!(!claim(&key_a));
+        assert!(claim(&key_b));
+        assert!(claim(&key_c));
+
+        release(&key_a);
+        assert!(claim(&key_a));
+
+        release(&key_a);
+        release(&key_b);
+        release(&key_c);
+    }
+}
