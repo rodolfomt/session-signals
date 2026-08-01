@@ -4,19 +4,25 @@ import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { DEFAULT_CONFIG, SOUNDS, type Config, type StateNotify } from "../state/config";
 import type { WidgetPrefs } from "../state/types";
+import { RECURRING_STATES, type AlertStubStatus } from "../state/alerts";
 import { useTheme } from "../themes/useTheme";
 import { THEME_LIST, type ThemePalette } from "../themes";
 import { StateGlyph } from "../components/StateGlyph";
 import { shapeForState } from "../components/glyphShape";
 import SessionFiltering from "./SessionFiltering";
+import { StubDetail, AlertsFolderCard } from "./AlertStubs";
 import "./Settings.css";
 
-type StateKey = "needs_you" | "working" | "ready";
+type StateKey = "needs_you" | "working" | "ready" | "waiting_review";
 
 const STATE_META: Record<StateKey, { title: string; hint: string }> = {
   needs_you: { title: "Needs you", hint: "Alert when a session is blocked on you" },
   working: { title: "Working", hint: "Usually off — you don’t need pinging mid-run" },
   ready: { title: "Ready", hint: "Alert when a turn finishes and it’s your move" },
+  waiting_review: {
+    title: "Waiting for Review",
+    hint: "Alert when a session you flagged finishes",
+  },
 };
 
 export default function Settings() {
@@ -30,8 +36,19 @@ export default function Settings() {
   const [status, setStatus] = useState<{ msg: string; kind: "ok" | "err" } | null>(null);
   const [appVersion, setAppVersion] = useState("");
   const [widgetOpacity, setWidgetOpacity] = useState(0.95);
+  const [stubs, setStubs] = useState<AlertStubStatus | null>(null);
+  const [alertsPath, setAlertsPath] = useState("");
   const flashTimer = useRef<number | undefined>(undefined);
   const filterSectionRef = useRef<HTMLDivElement>(null);
+
+  const refreshStubs = useCallback(() => {
+    invoke<AlertStubStatus>("alert_stub_status")
+      .then(setStubs)
+      .catch(() => {});
+    invoke<string>("alerts_dir_path")
+      .then(setAlertsPath)
+      .catch(() => {});
+  }, []);
 
   const flash = useCallback((msg: string, kind: "ok" | "err") => {
     setStatus({ msg, kind });
@@ -63,12 +80,20 @@ export default function Settings() {
       .then((p) => setWidgetOpacity(p.opacity))
       .catch(() => {});
     refreshHooks();
+    refreshStubs();
     // Read the running app version straight from Tauri so it always reflects the
     // built bundle — never hardcoded (single source of truth is package.json).
     getVersion()
       .then(setAppVersion)
       .catch(() => {});
-  }, [refreshHooks]);
+  }, [refreshHooks, refreshStubs]);
+
+  // A stub dropped into (or removed from) `alerts/` while Settings is open is
+  // picked up on refocus — no file-watcher, see the plan's "NOT Building".
+  useEffect(() => {
+    window.addEventListener("focus", refreshStubs);
+    return () => window.removeEventListener("focus", refreshStubs);
+  }, [refreshStubs]);
 
   // Tray-menu actions (install/uninstall hooks) report their result through
   // this event; surface it as a toast and refresh the hook card so it reflects
@@ -243,16 +268,21 @@ export default function Settings() {
           {(Object.keys(STATE_META) as StateKey[]).map((key, i) => (
             <StateRow
               key={key}
+              stateKey={key}
               first={i === 0}
               color={palette.states[key]}
               shape={shapeForState(key)}
               title={STATE_META[key].title}
               hint={STATE_META[key].hint}
               value={cfg[key]}
+              detected={stubs?.[key] ?? false}
+              recurring={(RECURRING_STATES as readonly string[]).includes(key)}
               onChange={(partial) => patchState(key, partial)}
+              flash={flash}
             />
           ))}
         </div>
+        <AlertsFolderCard path={alertsPath} flash={flash} onRefresh={refreshStubs} />
         <label className="sCheckRow">
           <Toggle checked={cfg.notify_idle} onChange={(v) => patch({ notify_idle: v })} />
           <span>Notify when a session goes idle (stale)</span>
@@ -509,55 +539,75 @@ function SoundIcon({ on }: { on: boolean }) {
 }
 
 function StateRow({
+  stateKey,
   first,
   color,
   shape,
   title,
   hint,
   value,
+  detected,
+  recurring,
   onChange,
+  flash,
 }: {
+  stateKey: StateKey;
   first: boolean;
   color: string;
-  shape: "square" | "dot" | "check" | "ring";
+  shape: "square" | "dot" | "check" | "ring" | "triangle";
   title: string;
   hint: string;
   value: StateNotify;
+  detected: boolean;
+  recurring: boolean;
   onChange: (partial: Partial<StateNotify>) => void;
+  flash: (msg: string, kind: "ok" | "err") => void;
 }) {
   return (
     <div className={`sStateRow ${first ? "first" : ""}`}>
-      <StateGlyph shape={shape} color={color} size={18} />
-      <div className="sStateText">
-        <span className="sStateTitle">{title}</span>
-        <span className="sStateHint">{hint}</span>
-      </div>
-      <div className="sStateControls">
-        {value.enabled && value.sound && (
-          <select
-            className="sSelect"
-            value={value.sound_name}
-            onChange={(e) => onChange({ sound_name: e.target.value })}
-            title="Notification sound"
+      <div className="sStateMain">
+        <StateGlyph shape={shape} color={color} size={18} />
+        <div className="sStateText">
+          <span className="sStateTitle">{title}</span>
+          <span className="sStateHint">{hint}</span>
+        </div>
+        <div className="sStateControls">
+          {value.enabled && value.sound && (
+            <select
+              className="sSelect"
+              value={value.sound_name}
+              onChange={(e) => onChange({ sound_name: e.target.value })}
+              title="Notification sound"
+            >
+              {SOUNDS.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          )}
+          <button
+            type="button"
+            className={`sSoundBtn ${value.sound ? "on" : ""}`}
+            disabled={!value.enabled}
+            onClick={() => onChange({ sound: !value.sound })}
+            title={value.sound ? "Sound on" : "Sound off"}
           >
-            {SOUNDS.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-        )}
-        <button
-          type="button"
-          className={`sSoundBtn ${value.sound ? "on" : ""}`}
-          disabled={!value.enabled}
-          onClick={() => onChange({ sound: !value.sound })}
-          title={value.sound ? "Sound on" : "Sound off"}
-        >
-          <SoundIcon on={value.sound} />
-        </button>
-        <Toggle checked={value.enabled} onChange={(v) => onChange({ enabled: v })} />
+            <SoundIcon on={value.sound} />
+          </button>
+          <Toggle checked={value.enabled} onChange={(v) => onChange({ enabled: v })} />
+        </div>
       </div>
+      {value.enabled && (
+        <StubDetail
+          stateKey={stateKey}
+          value={value}
+          detected={detected}
+          recurring={recurring}
+          onChange={onChange}
+          flash={flash}
+        />
+      )}
     </div>
   );
 }
@@ -579,6 +629,7 @@ function Onboarding({
         <StateGlyph shape="square" color={palette.states.needs_you} size={22} />
         <StateGlyph shape="dot" color={palette.states.working} size={22} />
         <StateGlyph shape="check" color={palette.states.ready} size={22} />
+        <StateGlyph shape="triangle" color={palette.states.waiting_review} size={22} />
         <StateGlyph shape="ring" color={palette.stale} size={22} />
       </div>
       <h1 className="sOnboardTitle">One quick setup</h1>

@@ -19,6 +19,7 @@ pub mod markers;
 mod notify;
 pub mod observe;
 pub mod proposals;
+mod reveal;
 pub mod token;
 mod tray;
 mod windows;
@@ -1021,6 +1022,23 @@ fn alert_stub_status() -> AlertStubStatus {
     }
 }
 
+/// Absolute path of the `alerts/` folder, for display in Settings.
+/// Empty string if `cli_alert::init` couldn't resolve it — the UI shows a
+/// "folder unavailable" state rather than a broken button.
+#[tauri::command]
+fn alerts_dir_path() -> String {
+    cli_alert::alerts_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
+}
+
+/// Open the `alerts/` folder in the OS file manager.
+#[tauri::command]
+fn reveal_alerts_dir() -> Result<(), String> {
+    let dir = cli_alert::alerts_dir().ok_or_else(|| "alerts folder unavailable".to_string())?;
+    reveal::reveal_dir(&dir)
+}
+
 /// Fire the stub for `state` immediately, with placeholder args — the
 /// Settings "test" button. Returns a short outcome string ("fired" /
 /// "no_stub" / "busy") rather than a bool so the UI can distinguish "nothing
@@ -1184,6 +1202,8 @@ pub fn run() {
             endpoint,
             alert_stub_status,
             test_alert_stub,
+            alerts_dir_path,
+            reveal_alerts_dir,
             focus_session,
             set_review_flag,
             widget_prefs,

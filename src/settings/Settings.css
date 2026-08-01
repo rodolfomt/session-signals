@@ -177,9 +177,16 @@ code {
 /* --- Notification state rows --- */
 .sStateRow {
   display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+}
+
+.sStateMain {
+  display: flex;
   align-items: center;
   gap: 12px;
-  padding: 12px 14px;
+  width: 100%;
 }
 
 .sStateRow:not(.first) {
@@ -237,6 +244,58 @@ code {
   padding: 4px 6px;
   font-family: var(--font-sans);
   font-size: 11px;
+}
+
+/* --- Alert stub detail (per-state, only while enabled) --- */
+.sStubDetail {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
+  margin-left: 30px;
+  background: #0e0f12;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+}
+
+.sStubRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.sStubStatus {
+  font-size: 11px;
+  color: var(--label-2);
+  flex: 1;
+}
+
+.sStubStatus.on {
+  color: var(--text-2);
+}
+
+.sStubHint {
+  font-size: 10.5px;
+  color: var(--label-2);
+  margin: 0;
+  line-height: 1.5;
+}
+
+/* --- Alerts folder card --- */
+.sAlertsFolderRow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+}
+
+.sAlertsPath {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+  margin: 0;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 
 /* --- Idle checkbox row --- */
