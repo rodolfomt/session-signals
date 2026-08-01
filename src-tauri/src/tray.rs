@@ -31,9 +31,13 @@ pub struct TrayPalette {
     pub orange: [u8; 3],
     pub green: [u8; 3],
     pub grey: [u8; 3],
+    /// Rollup color for `Rollup::Review` (a flagged session finished).
+    pub review: [u8; 3],
     pub needs_you: [u8; 3],
     pub working: [u8; 3],
     pub ready: [u8; 3],
+    /// State color for `State::WaitingReview`.
+    pub waiting_review: [u8; 3],
 }
 
 impl Default for TrayPalette {
@@ -45,9 +49,11 @@ impl Default for TrayPalette {
             orange: [245, 167, 66],
             green: [70, 201, 139],
             grey: [124, 130, 141],
+            review: [244, 89, 94],
             needs_you: [244, 89, 94],
             working: [245, 167, 66],
             ready: [70, 201, 139],
+            waiting_review: [244, 89, 94],
         }
     }
 }
@@ -56,6 +62,7 @@ impl TrayPalette {
     fn rollup_rgb(&self, rollup: Rollup) -> [u8; 3] {
         match rollup {
             Rollup::Red => self.red,
+            Rollup::Review => self.review,
             Rollup::Orange => self.orange,
             Rollup::Green => self.green,
             Rollup::Grey => self.grey,
@@ -76,6 +83,7 @@ fn icon_for(palette: &TrayPalette, rollup: Rollup) -> Image<'static> {
 fn tooltip_for(rollup: Rollup) -> &'static str {
     match rollup {
         Rollup::Red => "Session Signals — a session needs you",
+        Rollup::Review => "Session Signals — waiting for review",
         Rollup::Orange => "Session Signals — working",
         Rollup::Green => "Session Signals — ready",
         Rollup::Grey => "Session Signals — no live sessions",

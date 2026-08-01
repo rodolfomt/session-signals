@@ -11,9 +11,11 @@ export const dusk: Theme = {
       needs_you: "#cc6f76",
       working: "#c99b5a",
       ready: "#6fb89a",
+      waiting_review: "#cc6f76",
     },
     rollups: {
       red: "#cc6f76",
+      review: "#cc6f76",
       orange: "#c99b5a",
       green: "#6fb89a",
       grey: "#6e737d",

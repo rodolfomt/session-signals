@@ -1,4 +1,4 @@
-// The state glyph — four distinct silhouettes so state reads by SHAPE, not hue
+// The state glyph — five distinct silhouettes so state reads by SHAPE, not hue
 // (greyscale-safe, legible at 16px). Shape is a fixed function of the state;
 // the theme only supplies the color. Geometry is 1:1 with the design's Glyph.
 
@@ -59,6 +59,15 @@ export function StateGlyph({
       )}
       {shape === "ring" && (
         <circle cx="12" cy="12" r="7.4" fill="none" stroke={color} strokeWidth="2.6" />
+      )}
+      {shape === "triangle" && (
+        <path
+          d="M12 4.6 L19.8 18.4 L4.2 18.4 Z"
+          fill={color}
+          stroke={color}
+          strokeWidth="2.4"
+          strokeLinejoin="round"
+        />
       )}
     </svg>
   );

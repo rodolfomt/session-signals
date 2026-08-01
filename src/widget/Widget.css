@@ -304,6 +304,31 @@ body {
   flex: none;
 }
 
+/* Per-row "flag for review" toggle — the app's first user→engine control.
+   Dim triangle outline at rest; fills in once the flag is set, so the row
+   previews what its next `Stop` will turn into. */
+.wReviewToggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0 0 0 auto;
+  cursor: pointer;
+  opacity: 0.4;
+  flex: none;
+  transition: opacity 0.12s ease;
+}
+
+.wReviewToggle:hover {
+  opacity: 0.85;
+}
+
+.wReviewToggleOn {
+  opacity: 1;
+}
+
 .wRowState {
   font-size: 11.5px;
   font-weight: 500;

@@ -34,12 +34,43 @@ complete — see **Build phases** below).
 | State | Color | Meaning (user POV) | Set by |
 |---|---|---|---|
 | Needs you | 🔴 Red | Blocked on you — permission, choice, or answer | `Notification` (type ∈ permission_prompt, elicitation_dialog) |
-| Working | 🟠 Orange | Actively running — don't interrupt | `UserPromptSubmit`; `PostToolUse` heartbeat |
+| Working | 🟠 Orange | Actively running — don't interrupt | `UserPromptSubmit`; `PostToolUse` heartbeat; a `Stop` deferred by live subagents |
 | Ready | 🟢 Green | Finished its turn — okay to give new instructions | `Stop`, `SubagentStop`, `SessionStart` |
+| Waiting for Review | 🔴▲ Red triangle | Finished, and you flagged it for review first | `Stop`/`StopFailure`/`PostCompact` on a session flagged via `set_review_flag` |
 | None / stale | ⚪ Grey | No live session / session went silent | `SessionEnd`, or stale timeout |
 
-**Tray rollup priority:** Red > Orange > Green > Grey. (Tray is red if *any*
-session needs you; orange if any is working and none needs you; etc.)
+**Tray rollup priority:** Red > Review (red triangle) > Orange > Green > Grey.
+(Tray is red if *any* session needs you; the triangle if any is waiting for
+review and none needs you; orange if any is working and neither of those;
+etc.)
+
+**Waiting for Review** is the app's first user→engine command, not a
+hook-derived state: the widget's per-row toggle calls `set_review_flag(id,
+bool)`, setting `Session.review_when_done`. Setting it changes nothing by
+itself — it only changes what the session's *next* terminal transition
+(`Stop` / `StopFailure` / `PostCompact`) resolves to: `WaitingReview` instead
+of `Ready` (see `engine::terminal_state`, the single source of truth both the
+`Stop` and `SubagentStop` arms share). **Clearing** it is the one exception:
+if the session has *already* finished into `WaitingReview`, clearing the flag
+restores `Ready` immediately — waiting for another `Stop` (which may never
+arrive again for an already-finished session) would leave a stale red
+triangle after the user said "never mind." This asymmetry is deliberate:
+plain `Ready` is also a brand-new session's resting state, and there is no
+way to tell "just finished" apart from "hasn't started a turn yet" from state
+alone, so *setting* the flag on a `Ready` row never jumps it to
+`WaitingReview` early. The flag does not survive a `SessionEnd`/restart —
+"keep it simple." Shape (an upward triangle), not a fifth hue, carries the
+meaning: it reuses the existing red so the glyph still reads correctly in
+greyscale and at 16px.
+
+**A finished session is not "free" while subagents are still running.** A
+main-agent `Stop` while `subagent_count > 0` (and the session isn't blocked)
+defers the terminal transition — the row shows Working, not Ready/Waiting for
+Review — until the *last* matching `SubagentStop` releases it. A genuine
+block (`NeedsYou`) outranks the backlog in both directions: it neither gets
+forced to Working by a live-subagent `Stop`, nor does a draining
+`SubagentStop` clear it. See the `Stop`/`SubagentStop` arms in `engine.rs` and
+`Session.awaiting_subagents`.
 
 ## Hook contract
 
@@ -73,12 +104,33 @@ PostToolUse:
 Notification:
   permission_prompt   |
   elicitation_dialog    → state = NEEDS_YOU,              lastSeen = now
-  idle_prompt           → ignore (idle ≠ blocked; stays Ready until stale)
-  auth_success / other  → ignore (no state change)
-Stop                    → state = READY,                  lastSeen = now
+  idle_prompt         |
+  auth_success        |
+  elicitation_complete  → ignore, no lastSeen touch (known-inert: idle_prompt
+                          in particular fires BECAUSE the session is idle, so
+                          it must never postpone the stale timer — a past
+                          regression heartbeated here and let idle sessions
+                          stay green indefinitely; see engine.rs's
+                          `idle_prompt_does_not_postpone_or_clear_staleness`)
+  other/unrecognised     → heartbeat only, lastSeen = now (fail-open for
+                          undocumented types — agent_completed,
+                          agent_needs_input, anything invented later — never
+                          guessed at; see "Waiting for Review" below)
+Stop / StopFailure /
+PostCompact (main agent):
+  subagentCount > 0 &&
+    state == NEEDS_YOU    → awaitingSubagents = true,        lastSeen = now
+                            (heartbeat only — the block still wins)
+  subagentCount > 0        → awaitingSubagents = true, state = WORKING
+  else                     → state = terminalState(session)  // READY or
+                            WAITING_REVIEW, per review_when_done
 SubagentStart           → subagentCount++,                lastSeen = now (no state change)
-SubagentStop            → subagentCount--,                lastSeen = now (no state change)
-SessionEnd              → remove session
+SubagentStop            → subagentCount--,                lastSeen = now (no state change);
+                          if count hit 0 && awaitingSubagents && state != NEEDS_YOU:
+                            state = terminalState(session)  // releases the deferred transition
+set_review_flag(id, bool) → Session.review_when_done = bool (no state change;
+                            only affects the NEXT terminal transition)
+SessionEnd              → remove session (clears review_when_done, awaitingSubagents)
 (no event for staleTimeout) → mark stale, subagentCount = 0 → drop after grace
 ```
 
@@ -96,6 +148,17 @@ must not resume a genuinely-blocked parent. This is why a session can be
 RED/NEEDS_YOU with subagents running and not get cleared by their activity. The
 row's color tracks the main agent; the "N agents running" sub-line tracks
 subagents — fully independent. See `engine.rs` (`is_subagent`, `heartbeat`).
+
+> **This decision is narrowed, not reversed, by "Waiting for Review" above:**
+> a `SubagentStop` is now *allowed* to move the row's color — but only to
+> **release a transition the main agent's own `Stop` already earned and
+> deferred** (`awaiting_subagents`), never to invent one. It still can never
+> *clear* a `NeedsYou` (the guard is explicit in both the `Stop` and
+> `SubagentStop` arms), and it can never move a session into WORKING/READY on
+> its own initiative the way a genuine subagent-activity event (`SubagentStart`,
+> a subagent's `PostToolUse`) still cannot. The rule remains: only the main
+> agent originates a color change; a subagent can only release one already
+> owed.
 
 > ⚠️ **Verify before building (Phase 1):** confirm exact event names, the
 > `Notification` payload's type field, and that `http` + `async` hooks are
@@ -147,7 +210,8 @@ subagents — fully independent. See `engine.rs` (`is_subagent`, `heartbeat`).
 - Listener port: `4317`.
 - Stale timeout: `10` min.
 - Notifications: Red → OS notification **on**, sound **off**. Orange/Green
-  silent. Fire on **state transitions only**, never while idle.
+  silent. Waiting for Review → **on**, sound **off** (matches Red). Fire on
+  **state transitions only**, never while idle.
 - Widget: remembers position; expanded by default; opacity adjustable.
 - Launch on login: off by default.
 

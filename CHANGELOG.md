@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Waiting for Review** — a new fourth state (red, upward triangle) alongside
+  Needs you / Working / Ready. Flag a session from its widget row
+  (`set_review_flag`, the app's first user→engine command) and its next
+  finish lands there instead of plain Ready, so a green light stays
+  trustworthy. Notifies on by default (no sound), matching Needs you; does
+  not survive a session restart. Clearing the flag on a session already
+  sitting in Waiting for Review restores Ready **immediately**, rather than
+  waiting for another finish that may never come.
+- A finished session with live subagents is no longer reported "free": a
+  main-agent `Stop` while `subagent_count > 0` now defers to Working until
+  the *last* matching `SubagentStop` releases the real transition (Ready or
+  Waiting for Review). A genuine block (Needs you) still outranks the
+  backlog in both directions — this narrows the existing "subagents never
+  recolor the parent" rule rather than reversing it: a `SubagentStop` may now
+  *release* a transition the main agent already earned, but never originate
+  one, and it still can never clear a real block.
+- The engine now explicitly fails open on genuinely unrecognised
+  `Notification.notification_type` values (including the undocumented
+  `agent_completed` / `agent_needs_input`): heartbeat only, never a state
+  change — deliberate rather than accidental, and covered by tests so a
+  future unrecognised type can't silently release a deferred transition or
+  clear Waiting for Review. Known-inert types (`idle_prompt`, `auth_success`,
+  `elicitation_complete`) are handled separately and do **not** heartbeat —
+  `idle_prompt` in particular must never refresh `last_seen`, or an idle
+  session could postpone (or even clear) its own stale timeout indefinitely.
+  A `#[ignore]`d, on-demand capture harness
+  (`src-tauri/tests/notification_capture.rs`) records the real payloads for
+  anyone who wants to resolve what `agent_completed` / `agent_needs_input`
+  actually mean.
 - Session ignore rules — hide machine-spawned Claude Code sessions (headless
   `claude --print` runs launched by background tooling) from the widget list and
   the tray rollup. Hidden sessions stay tracked but never colour the tray or fire

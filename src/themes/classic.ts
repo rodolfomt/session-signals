@@ -11,9 +11,11 @@ export const classic: Theme = {
       needs_you: "#f4595e",
       working: "#f5a742",
       ready: "#46c98b",
+      waiting_review: "#f4595e",
     },
     rollups: {
       red: "#f4595e",
+      review: "#f4595e",
       orange: "#f5a742",
       green: "#46c98b",
       grey: "#7c828d",

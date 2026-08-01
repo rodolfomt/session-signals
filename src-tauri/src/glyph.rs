@@ -6,7 +6,7 @@
 
 use crate::engine::Rollup;
 
-/// The four state silhouettes — shape carries the meaning, not hue (so the icon
+/// The five state silhouettes — shape carries the meaning, not hue (so the icon
 /// reads in greyscale and at 16px). Geometry is 1:1 with the webview StateGlyph.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Shape {
@@ -18,12 +18,15 @@ pub enum Shape {
     Check,
     /// None / stale — hollow ring.
     Ring,
+    /// Waiting for review — upward triangle.
+    Triangle,
 }
 
 /// Tray rollup → silhouette.
 pub fn shape_for_rollup(rollup: Rollup) -> Shape {
     match rollup {
         Rollup::Red => Shape::Square,
+        Rollup::Review => Shape::Triangle,
         Rollup::Orange => Shape::Dot,
         Rollup::Green => Shape::Check,
         Rollup::Grey => Shape::Ring,
@@ -78,6 +81,27 @@ fn signed_distance(shape: Shape, px: f32, py: f32, scale: f32) -> f32 {
                 6.8 * scale,
             ));
             d - 1.6 * scale // half of the 3.2 stroke
+        }
+        Shape::Triangle => {
+            // Upward triangle — apex, bottom-left, bottom-right — 1:1 with the
+            // SVG path in StateGlyph.tsx (`M12 4.6 L19.8 18.4 L4.2 18.4 Z`).
+            // `dist_segment` gives the unsigned distance to the nearest edge;
+            // signed via a same-side cross-product test (point-in-triangle),
+            // then rounded like the other filled shapes.
+            let apex = (12.0 * scale, 4.6 * scale);
+            let left = (4.2 * scale, 18.4 * scale);
+            let right = (19.8 * scale, 18.4 * scale);
+            let d = dist_segment(px, py, apex.0, apex.1, left.0, left.1)
+                .min(dist_segment(px, py, left.0, left.1, right.0, right.1))
+                .min(dist_segment(px, py, right.0, right.1, apex.0, apex.1));
+            let cross =
+                |ax: f32, ay: f32, bx: f32, by: f32| (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+            let c1 = cross(apex.0, apex.1, left.0, left.1);
+            let c2 = cross(left.0, left.1, right.0, right.1);
+            let c3 = cross(right.0, right.1, apex.0, apex.1);
+            let inside =
+                (c1 >= 0.0 && c2 >= 0.0 && c3 >= 0.0) || (c1 <= 0.0 && c2 <= 0.0 && c3 <= 0.0);
+            (if inside { -d } else { d }) - 1.2 * scale
         }
     }
 }
@@ -155,6 +179,18 @@ mod tests {
         let total = |b: &[u8]| b.iter().skip(3).step_by(4).map(|&a| a as u64).sum::<u64>();
         let ck = render_glyph_rgba(Shape::Check, [1, 2, 3], size);
         assert!(total(&sq) > total(&ck));
+    }
+
+    #[test]
+    fn triangle_is_opaque_inside_clear_outside() {
+        // size = 24 so pixel coords line up 1:1 with the design-space vertices
+        // (apex (12, 4.6), left (4.2, 18.4), right (19.8, 18.4)).
+        let size = 24;
+        let buf = render_glyph_rgba(Shape::Triangle, [5, 6, 7], size);
+        // Inside, below the centroid: fully covered.
+        assert_eq!(alpha_at(&buf, size, 12, 15), 255);
+        // Outside, off past the apex's corner: fully transparent.
+        assert_eq!(alpha_at(&buf, size, 2, 2), 0);
     }
 
     #[test]

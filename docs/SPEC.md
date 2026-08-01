@@ -24,9 +24,25 @@ they can hand over a new task — without watching the terminal.
 | Needs you | 🔴 Red | Claude can't proceed without you (permission, choice, answer) | `Notification` (permission_prompt / elicitation_dialog) |
 | Working | 🟠 Orange | Actively running — don't interrupt | `UserPromptSubmit`, `PostToolUse` heartbeat |
 | Ready | 🟢 Green | Turn finished — okay to give new instructions | `Stop`, `SubagentStop`, `SessionStart` |
+| Waiting for Review | 🔴▲ Red triangle | Finished, and you flagged it for review before moving on | `Stop`/`StopFailure`/`PostCompact` on a flagged session |
 | None / stale | ⚪ Grey | No live session, or session went silent | `SessionEnd`, stale timeout |
 
-Rollup priority: Red > Orange > Green > Grey.
+Rollup priority: Red > Review (red triangle) > Orange > Green > Grey.
+
+**Waiting for Review** is a user-set intent, not a hook-derived signal: the
+widget's per-row toggle calls `set_review_flag(session_id, bool)` — the app's
+first user→engine command — so the *next* time that session finishes it lands
+in `WaitingReview` instead of plain `Ready`. Shape, not a fifth hue, carries
+the meaning (an upward triangle, reusing the existing red) so the tray glyph
+still reads correctly in greyscale and at 16px. The flag is per-run: it does
+not survive a `SessionEnd`/restart.
+
+**A finished session with live subagents is not "free."** A main-agent `Stop`
+while `subagent_count > 0` defers the terminal transition to `Working` rather
+than reporting `Ready`/`WaitingReview` early; the deferred transition fires on
+the *last* matching `SubagentStop`. A genuine block (`NeedsYou`) still
+outranks this backlog in both directions — see CLAUDE.md's hook contract for
+the exact arm.
 
 > **Note:** `Notification` with `notification_type = idle_prompt` is **ignored**
 > (no state change). It fires when a session has merely been sitting idle, which
@@ -77,12 +93,20 @@ Claude Code session ──(hooks, async HTTP POST)──▶ 127.0.0.1:4317/hook
   session start (shipped in 0.2.0; originally deferred past v1).
 - Rows carry a per-session descriptor (Claude Code's session title, else the
   latest prompt) and a "N agents running" sub-line when subagents are active.
+- Each row has a "flag for review" toggle: sets `review_when_done` so the
+  session's next finish lands in Waiting for Review (red triangle) instead of
+  Ready. The row only sends intent — it never recolors itself locally; the
+  next engine snapshot drives the state (thin renderer, per CLAUDE.md).
+  Clearing the flag on a session already sitting in Waiting for Review is the
+  one exception: it restores Ready instantly rather than waiting for another
+  finish that may never come.
 - Sessions hidden by a filter rule (§5.7) never appear in the list.
 
 ### 5.4 Notifications
 - Per-state toggles; sound on/off per state.
 - Fire on state **transitions** only, never repeatedly while idle.
-- Defaults: Red on (no sound); Orange/Green off.
+- Defaults: Red on (no sound); Orange/Green off; Waiting for Review on (no
+  sound) — matches Red, since it's still something you asked to be told about.
 - Focus-aware: suppress a notification when that session's terminal is already
   focused (shipped in 0.2.0; originally deferred past v1).
 - A filtered-out session (§5.7) never notifies — unless it blocks on you, which
@@ -216,6 +240,21 @@ Full user-facing guide: [IGNORING_BOT_SPAWNED_SESSIONS.md](IGNORING_BOT_SPAWNED_
 - An `ignore_rules` cluster that crossed the propose threshold entirely in a
   previous run surfaces only after one more matching session re-supplies the
   sample text — the count persists, the readable sample deliberately does not.
+- A main-agent `Stop` while subagents are still live must not resurrect an
+  already-`SessionEnd`ed row: the deferred transition only fires when one is
+  genuinely owed (`awaiting_subagents`), never unconditionally, so a straggler
+  `SubagentStop` after the session ended stays inert (existing tombstone
+  behavior, unchanged).
+- A blocked session (`NeedsYou`) with live subagents must stay red through the
+  whole sequence — the main agent's `Stop` and the eventual last
+  `SubagentStop` both defer to the block rather than releasing a "finished"
+  color, in either direction.
+- Unrecognised `Notification.notification_type` values — including
+  `agent_completed` and `agent_needs_input`, which this app has not
+  characterised — fail open to a heartbeat: liveness refreshes, but they can
+  never release a deferred transition or clear a genuine `NeedsYou`/
+  `WaitingReview`. See §8's open question for what those types might be used
+  for once their semantics are known.
 
 ## 8. Open / deferred
 
@@ -236,6 +275,15 @@ Still open:
   within the currently-verified schema, so the transcript-head read stays
   load-bearing; `UserPromptSubmit`'s documented `prompt` field is an unverified
   candidate that has never been captured live against this repo's listener.
+- What `Notification.notification_type` values `agent_completed` and
+  `agent_needs_input` actually carry and when they fire, and whether
+  `PostToolUse.tool_response` for a `run_in_background` Bash call includes a
+  PID or shell id (which would be the prerequisite for any future
+  background-process tracking, itself still out of scope — it isn't
+  hook-observable today). Deliberately not guessed at: the engine fails open
+  on both (see `engine.rs`'s `unknown_notification_types_fail_open` tests), and
+  `src-tauri/tests/notification_capture.rs` is a `#[ignore]`d, on-demand
+  harness for recording the real payloads when someone wants to resolve this.
 
 ## 9. Phasing
 

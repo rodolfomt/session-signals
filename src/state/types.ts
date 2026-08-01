@@ -1,9 +1,9 @@
 // Shared types mirroring the Rust engine's serialized shapes. The UI never
 // derives state from these — it only renders what the engine sends.
 
-export type SessionState = "needs_you" | "working" | "ready";
+export type SessionState = "needs_you" | "working" | "ready" | "waiting_review";
 
-export type Rollup = "red" | "orange" | "green" | "grey";
+export type Rollup = "red" | "orange" | "green" | "grey" | "review";
 
 /// Where a session runs. "remote" is a session bridged in from a Linux VM/WSL
 /// (detected host-side from a POSIX cwd on a Windows host); "host" is local.
@@ -38,6 +38,9 @@ export interface SessionView {
   /// title (else the first prompt), derived locally from the transcript. `null`
   /// until one is available (e.g. a brand-new session). Display-only.
   descriptor: string | null;
+  /// Whether this session is flagged to land in `waiting_review` instead of
+  /// `ready` the next time it finishes. Drives the widget's per-row toggle.
+  review_when_done: boolean;
 }
 
 export interface SessionsPayload {
@@ -59,10 +62,12 @@ export const STATE_LABEL: Record<SessionState, string> = {
   needs_you: "Needs you",
   working: "Working",
   ready: "Ready",
+  waiting_review: "Waiting for Review",
 };
 
 export const ROLLUP_LABEL: Record<Rollup, string> = {
   red: "A session needs you",
+  review: "A session is waiting for review",
   orange: "Working",
   green: "Ready",
   grey: "No live sessions",

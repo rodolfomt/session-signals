@@ -4,20 +4,28 @@
 
 import type { Rollup, SessionState } from "../state/types";
 
-export type GlyphShape = "square" | "dot" | "check" | "ring";
+export type GlyphShape = "square" | "dot" | "check" | "ring" | "triangle";
 
-/// needs you → square · working → dot · ready → check.
+/// needs you → square · working → dot · waiting for review → triangle · ready → check.
 export function shapeForState(state: SessionState): GlyphShape {
-  return state === "needs_you" ? "square" : state === "working" ? "dot" : "check";
+  return state === "needs_you"
+    ? "square"
+    : state === "working"
+      ? "dot"
+      : state === "waiting_review"
+        ? "triangle"
+        : "check";
 }
 
 /// Tray rollup → shape (grey/none → ring).
 export function shapeForRollup(rollup: Rollup): GlyphShape {
   return rollup === "red"
     ? "square"
-    : rollup === "orange"
-      ? "dot"
-      : rollup === "green"
-        ? "check"
-        : "ring";
+    : rollup === "review"
+      ? "triangle"
+      : rollup === "orange"
+        ? "dot"
+        : rollup === "green"
+          ? "check"
+          : "ring";
 }

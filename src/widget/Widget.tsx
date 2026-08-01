@@ -43,6 +43,7 @@ const ROW_STATE_TEXT: Record<SessionState, string> = {
   needs_you: "Needs your input",
   working: "Working",
   ready: "Ready for you",
+  waiting_review: "Waiting for review",
 };
 
 function rowColor(palette: ThemePalette, s: LiveSession): string {
@@ -113,6 +114,8 @@ function headerStatus(rollup: Rollup, sessions: LiveSession[]): string {
   const needs = sessions.filter((s) => s.state === "needs_you" && !s.stale).length;
   if (needs > 0) return `${needs} needs you`;
   switch (rollup) {
+    case "review":
+      return "Waiting for review";
     case "orange":
       return "Working";
     case "green":
@@ -194,6 +197,39 @@ function ExpandedRow({ session, palette }: { session: LiveSession; palette: Them
                 {branch}
               </span>
             )}
+            {/* First user→engine command in the app: flag this session so its
+                next `Stop` lands in Waiting for Review (red triangle) instead
+                of Ready. `stopPropagation` keeps this from also triggering the
+                row's own click-to-focus handler. The button only sends intent
+                — it never guesses the resulting state; the next engine
+                snapshot drives that (thin renderer). */}
+            <button
+              type="button"
+              className={`wReviewToggle${session.review_when_done ? " wReviewToggleOn" : ""}`}
+              aria-label={
+                session.review_when_done
+                  ? "Won’t flag for review when it finishes"
+                  : "Flag for review when it finishes"
+              }
+              title={
+                session.review_when_done
+                  ? "Won’t flag for review when it finishes"
+                  : "Flag for review when it finishes"
+              }
+              onClick={(e) => {
+                e.stopPropagation();
+                invoke("set_review_flag", {
+                  sessionId: session.session_id,
+                  flag: !session.review_when_done,
+                }).catch(() => {});
+              }}
+            >
+              <StateGlyph
+                shape="triangle"
+                color={session.review_when_done ? palette.states.waiting_review : palette.stale}
+                size={13}
+              />
+            </button>
           </div>
           {session.descriptor && (
             <div className="wRowDesc" title={session.descriptor}>
